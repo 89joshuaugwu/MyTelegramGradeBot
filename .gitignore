@@ -48,6 +48,8 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+test/
+tests/
 
 # Translations
 *.mo
@@ -139,5 +141,15 @@ dmypy.json
 config.json
 secrets.json
 *.db
+exam_data.db
 data/
 logs/
+
+# Backup/Copy files
+*copy.py
+*backup.py
+*.bak
+
+# Environment files (keep .env.example but not .env)
+.env
+!.env.example
