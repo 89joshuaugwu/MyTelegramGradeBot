@@ -43,6 +43,13 @@ except:
     SPEECH_RECOGNIZER = None
     VOICE_SUPPORT = False
 
+# Gemini AI
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except:
+    GEMINI_AVAILABLE = False
+
 load_dotenv()
 
 # ============================================================================
@@ -51,10 +58,23 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if not TELEGRAM_TOKEN:
     print("❌ ERROR: TELEGRAM_TOKEN missing in .env file!")
     sys.exit(1)
+
+# Initialize Gemini if API key available
+GEMINI_MODEL = None
+if GEMINI_API_KEY and GEMINI_AVAILABLE:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        GEMINI_MODEL = genai.GenerativeModel('gemini-2.0-flash')
+        print("✅ Gemini AI initialized successfully!")
+    except Exception as e:
+        print(f"⚠️ Gemini initialization failed: {e}")
+        GEMINI_MODEL = None
+
 
 if os.name == "nt":
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -62,7 +82,9 @@ if os.name == "nt":
 # Conversation states
 (START, TEACHER_LOGIN, TEACHER_REGISTER, TEACHER_MENU, CREATE_QUESTION,
  STUDENT_MAIN, FIND_ASSIGNMENT, ANSWER_SUBMISSION, QUICK_GRADE_MENU,
- QUICK_GRADE_SETUP, QUICK_GRADE_ANSWER, TEACHER_DASHBOARD) = range(12)
+ QUICK_GRADE_SETUP, QUICK_GRADE_ANSWER, TEACHER_DASHBOARD, 
+ ASSIGN_DEADLINE, ASSIGN_COLLECT_DETAILS, ASSIGN_ADD_FIELDS, 
+ EDIT_ASSIGNMENT, VIEW_SUBMISSION_DETAILS, STUDENT_FILL_DETAILS) = range(18)
 
 # ============================================================================
 # DATABASE SETUP - ENHANCED WITH TEACHER ACCOUNTS
@@ -78,18 +100,20 @@ def init_db():
         (teacher_id INTEGER PRIMARY KEY, telegram_id INT UNIQUE, username TEXT UNIQUE,
          password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
     
-    # Questions/Assignments table
+    # Questions/Assignments table - EXPANDED
     c.execute('''CREATE TABLE IF NOT EXISTS assignments
         (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
          title TEXT, question TEXT, question_type TEXT, 
          max_score INT, grading_scale INT, created_at TIMESTAMP, 
-         answers JSON, rubric JSON, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+         answers JSON, rubric JSON, deadline_at TIMESTAMP, 
+         required_fields JSON, is_active INT DEFAULT 1,
+         FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
     
-    # Student submissions
+    # Student submissions - EXPANDED
     c.execute('''CREATE TABLE IF NOT EXISTS submissions
         (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
          student_id INT, answer TEXT, score REAL, max_score INT,
-         grading_details JSON, submitted_at TIMESTAMP,
+         grading_details JSON, submitted_at TIMESTAMP, student_details JSON,
          FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
     
     # Quick grading cache
@@ -97,6 +121,29 @@ def init_db():
         (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
          answer_given TEXT, score REAL, max_score INT,
          graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+    
+    conn.commit()
+    
+    # ADD MISSING COLUMNS TO EXISTING TABLES (for migration from old schema)
+    try:
+        c.execute("ALTER TABLE assignments ADD COLUMN deadline_at TIMESTAMP")
+    except:
+        pass
+    
+    try:
+        c.execute("ALTER TABLE assignments ADD COLUMN required_fields JSON")
+    except:
+        pass
+    
+    try:
+        c.execute("ALTER TABLE assignments ADD COLUMN is_active INT DEFAULT 1")
+    except:
+        pass
+    
+    try:
+        c.execute("ALTER TABLE submissions ADD COLUMN student_details JSON")
+    except:
+        pass
     
     conn.commit()
     return conn
@@ -162,6 +209,31 @@ def normalize_text(s):
     s = re.sub(r'\s+', ' ', s)
     return s
 
+def format_score_with_color(score, max_score):
+    """Format score with color coding (emoji indicators)"""
+    percentage = (score / max_score * 100) if max_score > 0 else 0
+    if percentage >= 80:
+        emoji = "🟢"
+    elif percentage >= 60:
+        emoji = "🟡"
+    else:
+        emoji = "🔴"
+    return f"{emoji} {score}/{max_score} ({percentage:.1f}%)"
+
+def is_assignment_expired(deadline_at):
+    """Check if assignment deadline has passed"""
+    if not deadline_at:
+        return False
+    deadline = datetime.fromisoformat(deadline_at) if isinstance(deadline_at, str) else deadline_at
+    return datetime.now() > deadline
+
+def get_deadline_string(deadline_at):
+    """Format deadline for display"""
+    if not deadline_at:
+        return "No deadline"
+    deadline = datetime.fromisoformat(deadline_at) if isinstance(deadline_at, str) else deadline_at
+    return deadline.strftime("%B %d, %Y at %I:%M %p")
+
 def ocr_from_image_bytes(image_bytes):
     """Extract text from image"""
     try:
@@ -171,11 +243,80 @@ def ocr_from_image_bytes(image_bytes):
         return "[OCR failed]"
 
 # ============================================================================
+# GEMINI AI GRADING FUNCTION
+# ============================================================================
+
+def grade_with_gemini(student_answer, expected_answer, max_score, question_type="semantic"):
+    """Grade using Google Gemini AI with detailed feedback"""
+    if not GEMINI_MODEL:
+        return None, None
+    
+    try:
+        prompt = f"""You are an expert exam grader. Score this student answer fairly and provide constructive feedback.
+
+EXPECTED ANSWER: {expected_answer}
+STUDENT ANSWER: {student_answer}
+MAX SCORE: {max_score}
+QUESTION TYPE: {question_type}
+
+Your task: Grade the student's answer and provide brief feedback.
+
+RESPOND WITH ONLY THIS JSON FORMAT (no markdown, no code blocks, no extra text):
+{{"score": <number>, "feedback": "<feedback under 30 words>"}}
+
+Scoring Rules:
+- {max_score} points: Perfect answer, matches expected meaning exactly
+- {int(max_score * 0.7)} points: Good answer, minor gaps or extra info
+- {int(max_score * 0.5)} points: Acceptable, missing some key points
+- {int(max_score * 0.3)} points: Partial understanding, major gaps
+- 0 points: Wrong or irrelevant answer"""
+
+        response = GEMINI_MODEL.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=100,
+                top_p=0.8,
+            )
+        )
+        
+        response_text = response.text.strip()
+        
+        # Remove markdown code blocks if present
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        
+        response_text = response_text.strip()
+        
+        # Try to extract JSON if it's embedded in text
+        if "{" in response_text:
+            response_text = response_text[response_text.find("{"):response_text.rfind("}")+1]
+        
+        result = json.loads(response_text)
+        
+        score = int(result.get('score', 0))
+        # Ensure score is within bounds
+        score = max(0, min(int(score), max_score))
+        feedback = str(result.get('feedback', 'Answer graded by AI')).strip()
+        
+        return score, feedback
+    except json.JSONDecodeError as e:
+        print(f"⚠️ Gemini JSON parse error: {e}")
+        return None, None
+    except Exception as e:
+        print(f"⚠️ Gemini grading error: {e}")
+        return None, None
+
+# ============================================================================
 # GRADING FUNCTIONS
 # ============================================================================
 
 def grade_answer(student_answer, expected_answer, max_score, question_type="short"):
-    """Grade student answer"""
+    """Grade student answer - uses Gemini AI if available for semantic mode"""
     sa = normalize_text(student_answer)
     ea = normalize_text(expected_answer)
     
@@ -191,23 +332,34 @@ def grade_answer(student_answer, expected_answer, max_score, question_type="shor
         score = int((matched / len(keywords) * max_score)) if keywords else 0
         detail = f"Matched {matched}/{len(keywords)} keywords"
     
-    elif question_type == "semantic" and USE_EMBEDDINGS:
-        try:
-            student_emb = EMBED_MODEL.encode(sa, convert_to_tensor=True)
-            expected_emb = EMBED_MODEL.encode(ea, convert_to_tensor=True)
-            similarity = float(util.cos_sim(student_emb, expected_emb))
-            if similarity > 0.8:
-                score = max_score
-            elif similarity > 0.6:
-                score = int(max_score * 0.7)
-            elif similarity > 0.4:
-                score = int(max_score * 0.4)
-            else:
+    elif question_type == "semantic":
+        # Try Gemini first if available
+        if GEMINI_MODEL:
+            gemini_score, gemini_feedback = grade_with_gemini(student_answer, expected_answer, max_score, "semantic")
+            if gemini_score is not None:
+                return gemini_score, f"🤖 Gemini AI: {gemini_feedback}"
+        
+        # Fallback to sentence-transformers embeddings
+        if USE_EMBEDDINGS:
+            try:
+                student_emb = EMBED_MODEL.encode(sa, convert_to_tensor=True)
+                expected_emb = EMBED_MODEL.encode(ea, convert_to_tensor=True)
+                similarity = float(util.cos_sim(student_emb, expected_emb))
+                if similarity > 0.8:
+                    score = max_score
+                elif similarity > 0.6:
+                    score = int(max_score * 0.7)
+                elif similarity > 0.4:
+                    score = int(max_score * 0.4)
+                else:
+                    score = 0
+                detail = f"📊 Semantic match: {similarity:.2f}"
+            except:
                 score = 0
-            detail = f"Semantic match: {similarity:.2f}"
-        except:
+                detail = "AI grading failed"
+        else:
             score = 0
-            detail = "AI grading failed"
+            detail = "AI unavailable"
     
     else:
         score = 0
@@ -243,7 +395,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"👋 Welcome {user_name}!\n\n"
+        "👋 **Welcome!**\n\n"
         "🎓 **Smart Exam & Assignment System**\n\n"
         "Choose your role:",
         reply_markup=reply_markup,
@@ -497,7 +649,138 @@ async def create_assignment_start(update: Update, context: ContextTypes.DEFAULT_
     )
     
     context.user_data['assign_step'] = 'title'
+    context.user_data['required_fields'] = []
     return CREATE_QUESTION
+
+async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE, teacher_id):
+    """Finalize and save assignment to database"""
+    max_score = context.user_data.get('assign_max_score')
+    
+    # Get teacher's grading scale
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    c.execute("SELECT grading_scale FROM teachers WHERE teacher_id=?", (teacher_id,))
+    scale = c.fetchone()[0]
+    
+    # Create assignment
+    assignment_id = str(uuid.uuid4())
+    code = generate_assignment_code()
+    required_fields = json.dumps(context.user_data.get('required_fields', []))
+    deadline_at = context.user_data.get('assign_deadline')
+    
+    c.execute('''INSERT INTO assignments 
+                (assignment_id, teacher_id, code, title, question, 
+                 question_type, max_score, grading_scale, created_at, answers, 
+                 required_fields, deadline_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (assignment_id, teacher_id, code, context.user_data['assign_title'],
+               context.user_data['assign_question'], context.user_data['assign_type'],
+               max_score, scale, datetime.now(), context.user_data['assign_answer'],
+               required_fields, deadline_at, 1))
+    conn.commit()
+    conn.close()
+    
+    deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
+    required_str = ""
+    if context.user_data.get('required_fields'):
+        required_str = f"\n📋 **Required Details:** {', '.join(context.user_data['required_fields'])}"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
+    
+    await update.message.reply_text(
+        f"✅ **ASSIGNMENT CREATED!**\n\n"
+        f"📌 **Title:** {context.user_data['assign_title']}\n"
+        f"🔑 **Assignment Code:** `{code}`\n"
+        f"📊 **Max Score:** {max_score}/{scale}\n"
+        f"❓ **Question Type:** {context.user_data['assign_type']}"
+        f"{deadline_str}{required_str}\n\n"
+        f"Share the code with students so they can access this assignment!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    # Clear assignment data
+    context.user_data['assign_step'] = None
+    context.user_data['required_fields'] = []
+
+async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View assignment details and submissions"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract assignment ID from callback
+    callback_data = query.data
+    assign_id_prefix = callback_data.replace("view_assign_", "")
+    
+    teacher_id = context.user_data.get('teacher_id')
+    
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    # Get assignment details
+    c.execute('''SELECT assignment_id, code, title, question, question_type, max_score, 
+                        deadline_at, required_fields, created_at, is_active
+                 FROM assignments 
+                 WHERE teacher_id=? AND assignment_id LIKE ?''', 
+              (teacher_id, f"{assign_id_prefix}%"))
+    assign = c.fetchone()
+    
+    if not assign:
+        await query.edit_message_text("❌ Assignment not found.")
+        return TEACHER_MENU
+    
+    assignment_id, code, title, question, qtype, max_score, deadline_at, required_fields_json, created_at, is_active = assign
+    
+    # Get all submissions
+    c.execute('''SELECT submission_id, student_name, student_id, answer, score, max_score, submitted_at, student_details
+                 FROM submissions 
+                 WHERE assignment_id=?
+                 ORDER BY submitted_at DESC''', (assignment_id,))
+    submissions = c.fetchall()
+    conn.close()
+    
+    context.user_data['edit_assign_id'] = assignment_id
+    
+    deadline_str = f"\n📅 Deadline: {get_deadline_string(deadline_at)}" if deadline_at else ""
+    required_str = ""
+    if required_fields_json:
+        try:
+            fields = json.loads(required_fields_json)
+            if fields:
+                required_str = f"\n📋 Required Details: {', '.join(fields)}"
+        except:
+            pass
+    
+    status_emoji = "🟢" if is_active else "🔴"
+    
+    text = f"📌 **ASSIGNMENT DETAILS**\n\n"
+    text += f"{status_emoji} **Title:** {title}\n"
+    text += f"🔑 **Code:** `{code}`\n"
+    text += f"❓ **Type:** {qtype}\n"
+    text += f"📊 **Max Score:** {max_score}\n"
+    text += f"❓ **Question:** {question}{deadline_str}{required_str}\n\n"
+    text += f"📨 **Submissions:** {len(submissions)}\n"
+    
+    if submissions:
+        text += f"\n**Recent Submissions:**\n"
+        for subm_id, student_name, student_id, answer, score, subm_max, submitted_at, student_details in submissions[:5]:
+            score_colored = format_score_with_color(score, subm_max)
+            text += f"  {score_colored} - {student_name}\n"
+    
+    keyboard = []
+    if submissions:
+        keyboard.append([InlineKeyboardButton("👥 View All Submissions", callback_data=f"view_subs_{assignment_id[:8]}")])
+    
+    keyboard.append([InlineKeyboardButton("✏️ Edit Assignment", callback_data=f"edit_assign_{assignment_id[:8]}")])
+    keyboard.append([InlineKeyboardButton("🗑️ Delete Assignment", callback_data=f"delete_assign_{assignment_id[:8]}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="my_assignments")])
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    return TEACHER_MENU
 
 async def handle_assignment_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle assignment creation text input"""
@@ -538,47 +821,38 @@ async def handle_assignment_creation(update: Update, context: ContextTypes.DEFAU
     elif assign_step == 'max_score':
         try:
             max_score = int(text)
+            context.user_data['assign_max_score'] = max_score
             
-            # Get teacher's grading scale
-            conn = sqlite3.connect("exam_data.db")
-            c = conn.cursor()
-            c.execute("SELECT grading_scale FROM teachers WHERE teacher_id=?", (teacher_id,))
-            scale = c.fetchone()[0]
-            conn.close()
-            
-            # Create assignment
-            assignment_id = str(uuid.uuid4())
-            code = generate_assignment_code()
-            
-            conn = sqlite3.connect("exam_data.db")
-            c = conn.cursor()
-            c.execute('''INSERT INTO assignments 
-                        (assignment_id, teacher_id, code, title, question, 
-                         question_type, max_score, grading_scale, created_at, answers)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (assignment_id, teacher_id, code, context.user_data['assign_title'],
-                       context.user_data['assign_question'], context.user_data['assign_type'],
-                       max_score, scale, datetime.now(), context.user_data['assign_answer']))
-            conn.commit()
-            conn.close()
-            
-            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
-            
+            # Ask about required student details
+            keyboard = [
+                [InlineKeyboardButton("✅ Yes, collect details", callback_data="collect_details_yes")],
+                [InlineKeyboardButton("❌ No, skip details", callback_data="collect_details_no")]
+            ]
             await update.message.reply_text(
-                f"✅ **ASSIGNMENT CREATED!**\n\n"
-                f"📌 **Title:** {context.user_data['assign_title']}\n"
-                f"🔑 **Assignment Code:** `{code}`\n"
-                f"📊 **Max Score:** {max_score}/{scale}\n"
-                f"❓ **Question Type:** {context.user_data['assign_type']}\n\n"
-                f"Share the code with students so they can access this assignment!",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
+                "Step 6: Do you want to collect additional details from students when submitting answers?\n\n"
+                "Examples: Name, Phone, Student ID, Email, Gender, etc.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            
-            context.user_data['assign_step'] = None
-            return TEACHER_MENU
+            return CREATE_QUESTION
         except ValueError:
             await update.message.reply_text("❌ Please enter a valid number for max score")
+            return CREATE_QUESTION
+    
+    elif assign_step == 'deadline_date':
+        try:
+            # Parse deadline date in format: YYYY-MM-DD HH:MM or YYYY-MM-DD
+            deadline_str = text.strip()
+            if len(deadline_str) == 10:  # Only date provided
+                deadline_str += " 23:59"
+            deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
+            if deadline_dt <= datetime.now():
+                await update.message.reply_text("❌ Deadline must be in the future. Try again (format: YYYY-MM-DD HH:MM)")
+                return CREATE_QUESTION
+            context.user_data['assign_deadline'] = deadline_dt.isoformat()
+            await finalize_assignment(update, context, teacher_id)
+            return TEACHER_MENU
+        except ValueError:
+            await update.message.reply_text("❌ Invalid date format. Use: YYYY-MM-DD or YYYY-MM-DD HH:MM")
             return CREATE_QUESTION
 
 async def handle_assignment_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -605,6 +879,127 @@ async def handle_assignment_type(update: Update, context: ContextTypes.DEFAULT_T
     
     return CREATE_QUESTION
 
+async def handle_collect_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle yes/no for collecting student details"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "collect_details_yes":
+        context.user_data['collect_details'] = True
+        context.user_data['required_fields'] = []
+        keyboard = [
+            [InlineKeyboardButton("👤 Name", callback_data="add_field_name")],
+            [InlineKeyboardButton("📱 Phone", callback_data="add_field_phone")],
+            [InlineKeyboardButton("🪪 Registration Number", callback_data="add_field_reg")],
+            [InlineKeyboardButton("✉️ Email", callback_data="add_field_email")],
+            [InlineKeyboardButton("🔢 Gender", callback_data="add_field_gender")],
+            [InlineKeyboardButton("📚 Class/Grade", callback_data="add_field_class")],
+            [InlineKeyboardButton("✅ Done Adding", callback_data="fields_done")]
+        ]
+        await query.edit_message_text(
+            "Step 6.1: **Select required fields**\n\n"
+            "Click each field you want students to provide:\n"
+            "_(You can add multiple fields)_",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return CREATE_QUESTION
+    else:
+        context.user_data['collect_details'] = False
+        context.user_data['required_fields'] = []
+        keyboard = [[InlineKeyboardButton("Continue ➜", callback_data="proceed_deadline")]]
+        await query.edit_message_text(
+            "Step 6: No additional details will be collected.\n\n"
+            "Next, set a deadline for this assignment:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return CREATE_QUESTION
+
+async def handle_add_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle adding a field to required fields"""
+    query = update.callback_query
+    await query.answer()
+    
+    field_map = {
+        'add_field_name': 'Name',
+        'add_field_phone': 'Phone',
+        'add_field_reg': 'Registration Number',
+        'add_field_email': 'Email',
+        'add_field_gender': 'Gender',
+        'add_field_class': 'Class/Grade'
+    }
+    
+    field_name = field_map.get(query.data)
+    if field_name and field_name not in context.user_data.get('required_fields', []):
+        context.user_data['required_fields'].append(field_name)
+    
+    fields_added = ", ".join(context.user_data.get('required_fields', []))
+    if not fields_added:
+        fields_added = "_None selected yet_"
+    
+    keyboard = [
+        [InlineKeyboardButton("👤 Name", callback_data="add_field_name")],
+        [InlineKeyboardButton("📱 Phone", callback_data="add_field_phone")],
+        [InlineKeyboardButton("🪪 Registration Number", callback_data="add_field_reg")],
+        [InlineKeyboardButton("✉️ Email", callback_data="add_field_email")],
+        [InlineKeyboardButton("🔢 Gender", callback_data="add_field_gender")],
+        [InlineKeyboardButton("📚 Class/Grade", callback_data="add_field_class")],
+        [InlineKeyboardButton("✅ Done Adding", callback_data="fields_done")]
+    ]
+    await query.edit_message_text(
+        f"Step 6.1: **Selected Fields:**\n`{fields_added}`\n\n"
+        "Add more fields or click Done:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return CREATE_QUESTION
+
+async def handle_fields_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle done adding fields, proceed to deadline"""
+    query = update.callback_query
+    await query.answer()
+    
+    fields_list = context.user_data.get('required_fields', [])
+    fields_str = ", ".join(fields_list) if fields_list else "None"
+    
+    keyboard = [[InlineKeyboardButton("Continue ➜", callback_data="proceed_deadline")]]
+    await query.edit_message_text(
+        f"Step 6.2: **Required Fields Set**\n\n"
+        f"Fields: {fields_str}\n\n"
+        f"Next, set a deadline for this assignment:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return CREATE_QUESTION
+
+async def handle_proceed_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Proceed to deadline setup"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [[InlineKeyboardButton("⏭️ No Deadline", callback_data="no_deadline")]]
+    await query.edit_message_text(
+        "Step 7: **Set Assignment Deadline**\n\n"
+        "Send deadline date and time:\n"
+        "`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`\n\n"
+        "_Example: 2025-12-15 or 2025-12-15 18:00_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    context.user_data['assign_step'] = 'deadline_date'
+    return CREATE_QUESTION
+
+async def handle_no_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Skip deadline setup"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['assign_deadline'] = None
+    teacher_id = context.user_data.get('teacher_id')
+    await finalize_assignment(update, context, teacher_id)
+    return TEACHER_MENU
+
 async def view_my_assignments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View all assignments created by the teacher"""
     query = update.callback_query
@@ -619,7 +1014,7 @@ async def view_my_assignments(update: Update, context: ContextTypes.DEFAULT_TYPE
     c = conn.cursor()
     # Get assignments with submission counts
     c.execute('''SELECT a.assignment_id, a.code, a.title, a.question_type, a.max_score, a.created_at,
-                        COUNT(s.submission_id) as submission_count
+                        a.deadline_at, COUNT(s.submission_id) as submission_count
                  FROM assignments a
                  LEFT JOIN submissions s ON a.assignment_id = s.assignment_id
                  WHERE a.teacher_id=?
@@ -637,20 +1032,68 @@ async def view_my_assignments(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return TEACHER_MENU
     
-    # Format assignments list
-    text = "📋 **YOUR ASSIGNMENTS**\n\n"
-    for i, (aid, code, title, qtype, max_score, created_at, submission_count) in enumerate(assignments, 1):
-        text += f"{i}. **{title}**\n"
-        text += f"   🔑 Code: `{code}`\n"
-        text += f"   ❓ Type: {qtype}\n"
-        text += f"   📊 Max Score: {max_score}\n"
-        text += f"   ✍️ Submissions: {submission_count}\n\n"
+    # Format assignments list with clickable buttons
+    keyboard = []
+    for aid, code, title, qtype, max_score, created_at, deadline_at, submission_count in assignments:
+        deadline_indicator = "⏰" if deadline_at and not is_assignment_expired(deadline_at) else ""
+        status = "🟢" if not is_assignment_expired(deadline_at) or not deadline_at else "🔴"
+        button_text = f"{status} {title} ({submission_count} submissions) {deadline_indicator}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"view_assign_{aid[:8]}")])
     
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
+    keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")])
+    
+    text = "📋 **YOUR ASSIGNMENTS**\n\n"
+    text += f"Total: {len(assignments)} assignments\n\n"
+    text += "_Click an assignment to view details and submissions_"
+    
     await query.edit_message_text(
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
+    )
+    
+    return TEACHER_MENU
+
+async def handle_deactivate_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deactivate/Activate assignment"""
+    query = update.callback_query
+    await query.answer()
+    
+    assignment_id = context.user_data.get('edit_assign_id')
+    action = query.data.replace("activate_assign", "").replace("deactivate_assign", "")
+    is_active = 0 if "deactivate" in query.data else 1
+    
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    c.execute('UPDATE assignments SET is_active=? WHERE assignment_id=?', (is_active, assignment_id))
+    conn.commit()
+    conn.close()
+    
+    status = "✅ ACTIVATED" if is_active else "❌ DEACTIVATED"
+    await query.edit_message_text(f"{status} successfully!")
+    
+    return TEACHER_MENU
+
+async def handle_delete_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete assignment"""
+    query = update.callback_query
+    await query.answer()
+    
+    assignment_id = context.user_data.get('edit_assign_id')
+    
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    # Delete related submissions first
+    c.execute('DELETE FROM submissions WHERE assignment_id=?', (assignment_id,))
+    # Then delete assignment
+    c.execute('DELETE FROM assignments WHERE assignment_id=?', (assignment_id,))
+    conn.commit()
+    conn.close()
+    
+    keyboard = [[InlineKeyboardButton("Back to Assignments", callback_data="my_assignments")]]
+    await query.edit_message_text(
+        "🗑️ **Assignment deleted successfully!**",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
     return TEACHER_MENU
@@ -770,60 +1213,138 @@ async def handle_assignment_code(update: Update, context: ContextTypes.DEFAULT_T
     # Find assignment
     conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
-    c.execute('''SELECT assignment_id, title, question, question_type, max_score, grading_scale, answers
+    c.execute('''SELECT assignment_id, title, question, question_type, max_score, grading_scale, answers, deadline_at, is_active, required_fields
                  FROM assignments WHERE code=?''', (code,))
     result = c.fetchone()
     conn.close()
     
-    if result:
-        assignment_id, title, question, qtype, max_score, scale, answers = result
-        context.user_data['current_assignment_id'] = assignment_id
-        context.user_data['current_assignment_code'] = code
-        context.user_data['current_max_score'] = max_score
-        context.user_data['current_scale'] = scale
-        context.user_data['current_qtype'] = qtype
-        context.user_data['correct_answers'] = answers
-        
-        keyboard = [
-            [InlineKeyboardButton("📝 Submit Answer", callback_data="submit_answer")],
-            [InlineKeyboardButton("🔙 Back", callback_data="student_menu")]
-        ]
-        
-        await update.message.reply_text(
-            f"✅ **ASSIGNMENT FOUND!**\n\n"
-            f"📌 **Title:** {title}\n"
-            f"❓ **Question:** {question}\n"
-            f"📊 **Max Score:** {max_score}/{scale}\n\n"
-            f"Ready to answer?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        
-        return FIND_ASSIGNMENT
-    else:
+    if not result:
         await update.message.reply_text(
             "❌ Assignment code not found.\n\n"
             "Please check the code and try again. /start to go back"
         )
         return FIND_ASSIGNMENT
+    
+    assignment_id, title, question, qtype, max_score, scale, answers, deadline_at, is_active, required_fields_json = result
+    
+    # Check if assignment is active
+    if not is_active:
+        await update.message.reply_text(
+            "❌ **This assignment is no longer active.**\n\n"
+            "Please contact your teacher.\n\n/start to go back"
+        )
+        return FIND_ASSIGNMENT
+    
+    # Check if deadline passed
+    if deadline_at and is_assignment_expired(deadline_at):
+        await update.message.reply_text(
+            "❌ **DEADLINE PASSED**\n\n"
+            f"This assignment closed on {get_deadline_string(deadline_at)}\n\n"
+            "No more submissions are allowed.\n\n/start to go back"
+        )
+        return FIND_ASSIGNMENT
+    
+    context.user_data['current_assignment_id'] = assignment_id
+    context.user_data['current_assignment_code'] = code
+    context.user_data['current_max_score'] = max_score
+    context.user_data['current_scale'] = scale
+    context.user_data['current_qtype'] = qtype
+    context.user_data['correct_answers'] = answers
+    
+    # Parse required fields from database
+    try:
+        if required_fields_json:
+            context.user_data['required_fields'] = json.loads(required_fields_json)
+        else:
+            context.user_data['required_fields'] = []
+    except:
+        context.user_data['required_fields'] = []
+    
+    deadline_info = f"\n⏰ **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
+    
+    keyboard = [
+        [InlineKeyboardButton("📝 Submit Answer", callback_data="submit_answer")],
+        [InlineKeyboardButton("🔙 Back", callback_data="student_menu")]
+    ]
+    
+    await update.message.reply_text(
+        f"✅ **ASSIGNMENT FOUND!**\n\n"
+        f"📌 **Title:** {title}\n"
+        f"❓ **Question:** {question}\n"
+        f"📊 **Max Score:** {max_score}/{scale}{deadline_info}\n\n"
+        f"Ready to answer?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    return FIND_ASSIGNMENT
 
 async def submit_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Student submits answer"""
     query = update.callback_query
     await query.answer()
     
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="student_menu")]]
+    # Check if there are required fields
+    required_fields = context.user_data.get('required_fields', [])
     
-    await query.edit_message_text(
-        "📝 **SUBMIT YOUR ANSWER**\n\n"
-        "Type your answer:\n"
-        "(You can also send images or voice notes)",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    if required_fields:
+        # Collect required details first
+        context.user_data['fill_details_step'] = 0
+        context.user_data['student_details'] = {}
+        context.user_data['fields_to_fill'] = required_fields
+        
+        # Ask for first field
+        first_field = required_fields[0]
+        await query.edit_message_text(
+            f"📋 **REQUIRED INFORMATION**\n\n"
+            f"Question 1/{len(required_fields)}\n"
+            f"Enter your **{first_field}**:"
+        )
+        return STUDENT_FILL_DETAILS
+    else:
+        # No required details, go straight to answer submission
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="student_menu")]]
+        await query.edit_message_text(
+            "📝 **SUBMIT YOUR ANSWER**\n\n"
+            "Type your answer:\n"
+            "(You can also send images or voice notes)",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        context.user_data['mode'] = 'submit_answer'
+        return ANSWER_SUBMISSION
+
+async def handle_student_fill_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle student filling required details"""
+    text = update.message.text.strip()
+    step = context.user_data.get('fill_details_step', 0)
+    fields_to_fill = context.user_data.get('fields_to_fill', [])
     
-    context.user_data['mode'] = 'submit_answer'
-    return ANSWER_SUBMISSION
+    if step < len(fields_to_fill):
+        field_name = fields_to_fill[step]
+        context.user_data['student_details'][field_name] = text
+        step += 1
+        context.user_data['fill_details_step'] = step
+        
+        if step < len(fields_to_fill):
+            next_field = fields_to_fill[step]
+            await update.message.reply_text(
+                f"✅ Saved!\n\n"
+                f"Question {step + 1}/{len(fields_to_fill)}\n"
+                f"Enter your **{next_field}**:"
+            )
+            return STUDENT_FILL_DETAILS
+        else:
+            # All details collected, now ask for answer
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="student_menu")]]
+            await update.message.reply_text(
+                f"✅ **All information saved!**\n\n"
+                "📝 **Now, submit your answer:**",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            context.user_data['mode'] = 'submit_answer'
+            return ANSWER_SUBMISSION
 
 async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process student answer submission"""
@@ -842,6 +1363,7 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     max_score = context.user_data['current_max_score']
     qtype = context.user_data['current_qtype']
     correct_answers = context.user_data.get('correct_answers', answer)
+    student_details = context.user_data.get('student_details', {})
     
     # Map display names to grade_answer function parameter names
     qtype_map = {
@@ -859,19 +1381,20 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
     c.execute('''INSERT INTO submissions
-                (submission_id, assignment_id, student_name, student_id, answer, score, max_score, submitted_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-              (submission_id, assignment_id, student_name, student_id, answer, score, max_score, datetime.now()))
+                (submission_id, assignment_id, student_name, student_id, answer, score, max_score, submitted_at, student_details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (submission_id, assignment_id, student_name, student_id, answer, score, max_score, datetime.now(), json.dumps(student_details)))
     conn.commit()
     conn.close()
+    
+    score_colored = format_score_with_color(score, max_score)
     
     keyboard = [[InlineKeyboardButton("🔍 Find Another", callback_data="find_assignment")],
                 [InlineKeyboardButton("🏠 Back to Menu", callback_data="student_menu")]]
     
     await update.message.reply_text(
         f"✅ **ANSWER SUBMITTED!**\n\n"
-        f"📊 **Your Score:** {score}/{max_score}\n"
-        f"📈 **Percentage:** {(score/max_score*100):.1f}%\n"
+        f"📊 **Your Score:** {score_colored}\n"
         f"💡 **Feedback:** {detail}\n\n"
         f"What's next?",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1166,13 +1689,13 @@ def main():
     db = init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # Main conversation handler - FIXED PATTERNS
+    # Main conversation handler - EXPANDED
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             START: [
                 CallbackQueryHandler(teacher_mode_selector, pattern="^teacher_mode$"),
-                CallbackQueryHandler(direct_teacher_login, pattern="^teacher_login$"),  # ADDED THIS LINE
+                CallbackQueryHandler(direct_teacher_login, pattern="^teacher_login$"),
                 CallbackQueryHandler(student_mode, pattern="^student_mode$"),
             ],
             TEACHER_LOGIN: [
@@ -1190,11 +1713,20 @@ def main():
                 CallbackQueryHandler(view_my_assignments, pattern="^my_assignments$"),
                 CallbackQueryHandler(view_results_analytics, pattern="^view_results$"),
                 CallbackQueryHandler(logout, pattern="^logout$"),
-                CallbackQueryHandler(back_to_teacher_menu, pattern="^teacher_menu$"),  # ADDED THIS LINE
+                CallbackQueryHandler(back_to_teacher_menu, pattern="^teacher_menu$"),
+                CallbackQueryHandler(handle_view_assign_details, pattern="^view_assign_"),
+                CallbackQueryHandler(handle_delete_assign, pattern="^delete_assign_"),
+                CallbackQueryHandler(handle_deactivate_assign, pattern="^deactivate_assign_"),
+                CallbackQueryHandler(handle_deactivate_assign, pattern="^activate_assign_"),
             ],
             CREATE_QUESTION: [
                 CallbackQueryHandler(handle_assignment_type, pattern="^type_"),
-                CallbackQueryHandler(back_to_teacher_menu, pattern="^teacher_menu$"),  # ADDED THIS LINE
+                CallbackQueryHandler(handle_collect_details, pattern="^collect_details_"),
+                CallbackQueryHandler(handle_add_field, pattern="^add_field_"),
+                CallbackQueryHandler(handle_fields_done, pattern="^fields_done$"),
+                CallbackQueryHandler(handle_proceed_deadline, pattern="^proceed_deadline$"),
+                CallbackQueryHandler(handle_no_deadline, pattern="^no_deadline$"),
+                CallbackQueryHandler(back_to_teacher_menu, pattern="^teacher_menu$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_assignment_creation),
             ],
             STUDENT_MAIN: [
@@ -1207,6 +1739,9 @@ def main():
                 CallbackQueryHandler(submit_answer_handler, pattern="^submit_answer$"),
                 CallbackQueryHandler(back_to_student_menu, pattern="^student_menu$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_assignment_code),
+            ],
+            STUDENT_FILL_DETAILS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_student_fill_details),
             ],
             ANSWER_SUBMISSION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_student_answer),
@@ -1227,6 +1762,7 @@ def main():
     print("✅ Features: Teacher Accounts | Dynamic Questions | Student Answers")
     print("✅ Features: Quick Grading | Customizable Scales | Proper Navigation")
     print("✅ FIXED: Teacher login now working properly!")
+    print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
     print("\n📍 Waiting for users...\n")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
