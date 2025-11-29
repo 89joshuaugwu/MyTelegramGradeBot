@@ -52,6 +52,33 @@ except:
 
 load_dotenv()
 
+# --- BEGIN: tiny HTTP health server so Render detects a bound port ---
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Respond 200 OK for any GET (so visiting root returns "OK")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    # silence noisy logs
+    def log_message(self, format, *args):
+        return
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", "10000"))  # Render sets PORT automatically
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"[health] Listening on 0.0.0.0:{port}")
+    server.serve_forever()
+
+# start server in daemon thread so it doesn't block bot
+threading.Thread(target=_start_health_server, daemon=True).start()
+# --- END health server ---
+
+
 # ============================================================================
 # CONFIG
 # ============================================================================
