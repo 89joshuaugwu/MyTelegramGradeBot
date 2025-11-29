@@ -14,21 +14,14 @@ from datetime import datetime, timedelta
 from PIL import Image
 import pytesseract
 
-# Use psycopg3 with connection pooling
+# Use psycopg[binary] for database connections (psycopg 3 with psycopg2 compatibility)
 try:
     import psycopg
-    from psycopg_pool import ConnectionPool
+    # Enable psycopg2 compatibility
+    import psycopg2
     PSYCOPG_AVAILABLE = True
-    USE_PSYCOPG3 = True
 except ImportError:
-    # Fallback to psycopg2 if psycopg3 not available
-    try:
-        import psycopg2
-        PSYCOPG_AVAILABLE = True
-        USE_PSYCOPG3 = False
-    except ImportError:
-        PSYCOPG_AVAILABLE = False
-        USE_PSYCOPG3 = False
+    PSYCOPG_AVAILABLE = False
 
 import logging
 
@@ -142,76 +135,21 @@ if os.name == "nt":
  EDIT_ASSIGNMENT, VIEW_SUBMISSION_DETAILS, STUDENT_FILL_DETAILS) = range(18)
 
 # ============================================================================
-# DATABASE SETUP - POSTGRESQL WITH CONNECTION POOLING AND ERROR HANDLING
+# DATABASE SETUP - POSTGRESQL WITH ERROR HANDLING
 # ============================================================================
 
-# Global connection pool - initialized on first use
-DB_POOL = None
-
-def init_db_pool():
-    """Initialize connection pool for efficient database access"""
-    global DB_POOL
-    if DB_POOL is not None:
-        return DB_POOL
-    
+def get_db_connection():
+    """Get PostgreSQL database connection"""
     try:
-        if USE_PSYCOPG3:
-            DB_POOL = ConnectionPool(DATABASE_URL, open=False)
-            DB_POOL.open()
-            logger.info("✅ Database connection pool initialized successfully!")
-        else:
-            logger.warning("⚠️ Connection pooling only available with psycopg3. Using direct connections.")
-        return DB_POOL
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
     except Exception as e:
-        logger.error(f"❌ Failed to initialize connection pool: {e}")
+        logger.error(f"❌ Database connection error: {e}")
         return None
 
-def get_db_connection(retry_count=3):
-    """Get PostgreSQL database connection with retry logic
-    
-    Args:
-        retry_count: Number of times to retry on connection failure
-    
-    Returns:
-        Connection object or None if failed
-    """
-    global DB_POOL
-    
-    # Try to use connection pool if available
-    if USE_PSYCOPG3 and DB_POOL is not None:
-        try:
-            conn = DB_POOL.getconn()
-            return conn
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to get connection from pool: {e}")
-    
-    # Fallback: direct connection with retry logic
-    for attempt in range(retry_count):
-        try:
-            if USE_PSYCOPG3:
-                conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
-            else:
-                import psycopg2
-                conn = psycopg2.connect(DATABASE_URL)
-            logger.debug(f"✅ Database connection established (attempt {attempt + 1})")
-            return conn
-        except Exception as e:
-            if attempt < retry_count - 1:
-                logger.warning(f"⚠️ Connection attempt {attempt + 1}/{retry_count} failed: {e}")
-                import time
-                time.sleep(2 ** attempt)  # Exponential backoff
-            else:
-                logger.error(f"❌ All {retry_count} connection attempts failed: {e}")
-    
-    return None
-
 def close_db_connection(conn, cursor=None):
-    """Safely close database connection and cursor
-    
-    Args:
-        conn: Connection object to close
-        cursor: Optional cursor object to close
-    """
+    """Safely close database connection and cursor"""
     try:
         if cursor:
             cursor.close()
@@ -220,23 +158,13 @@ def close_db_connection(conn, cursor=None):
     
     try:
         if conn:
-            # Return to pool if from pool, otherwise close
-            if USE_PSYCOPG3 and DB_POOL is not None:
-                try:
-                    DB_POOL.putconn(conn)
-                except:
-                    conn.close()
-            else:
-                conn.close()
+            conn.close()
     except Exception as e:
         logger.warning(f"⚠️ Error closing connection: {e}")
 
 def init_db():
     """Initialize PostgreSQL database with teacher accounts"""
     try:
-        # Initialize connection pool first
-        init_db_pool()
-        
         conn = get_db_connection()
         if not conn:
             logger.error("❌ Failed to connect to database for initialization")
@@ -828,65 +756,68 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Database connection error. Please try again.")
         return TEACHER_MENU
     
-    c = conn.cursor()
-    c.execute("SELECT grading_scale FROM teachers WHERE teacher_id=%s", (teacher_id,))
-    result = c.fetchone()
-    if not result:
-        conn.close()
-        await update.message.reply_text("❌ Teacher not found.")
-        return TEACHER_MENU
-    scale = result[0]
-    
-    # Create assignment
-    assignment_id = str(uuid.uuid4())
-    code = generate_assignment_code()
-    
-    # FIX: Properly format required_fields as JSON
-    required_fields = context.user_data.get('required_fields', [])
-    required_fields_json = json.dumps(required_fields) if required_fields else json.dumps([])
-    
-    deadline_at = context.user_data.get('assign_deadline')
-    
     try:
-        c.execute('''INSERT INTO assignments 
-                    (assignment_id, teacher_id, code, title, question, 
-                     question_type, max_score, grading_scale, created_at, answers, 
-                     required_fields, deadline_at, is_active)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                  (assignment_id, teacher_id, code, context.user_data['assign_title'],
-                   context.user_data['assign_question'], context.user_data['assign_type'],
-                   max_score, scale, datetime.now(), context.user_data['assign_answer'],
-                   required_fields_json, deadline_at, 1))
-        conn.commit()
-        conn.close()
+        c = conn.cursor()
+        c.execute("SELECT grading_scale FROM teachers WHERE teacher_id=%s", (teacher_id,))
+        result = c.fetchone()
+        if not result:
+            await update.message.reply_text("❌ Teacher not found.")
+            return TEACHER_MENU
+        scale = result[0]
         
-        deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
-        required_str = ""
-        if required_fields:
-            required_str = f"\n📋 **Required Details:** {', '.join(required_fields)}"
+        # Create assignment
+        assignment_id = str(uuid.uuid4())
+        code = generate_assignment_code()
         
-        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
+        # FIX: Properly format required_fields as JSON
+        required_fields = context.user_data.get('required_fields', [])
+        required_fields_json = json.dumps(required_fields) if required_fields else json.dumps([])
         
-        await update.message.reply_text(
-            f"✅ **ASSIGNMENT CREATED!**\n\n"
-            f"📌 **Title:** {context.user_data['assign_title']}\n"
-            f"🔑 **Assignment Code:** `{code}`\n"
-            f"📊 **Max Score:** {max_score}/{scale}\n"
-            f"❓ **Question Type:** {context.user_data['assign_type']}"
-            f"{deadline_str}{required_str}\n\n"
-            f"Share the code with students so they can access this assignment!",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        deadline_at = context.user_data.get('assign_deadline')
         
-        # Clear assignment data
-        context.user_data['assign_step'] = None
-        context.user_data['required_fields'] = []
-        
-    except Exception as e:
-        conn.close()
-        await update.message.reply_text(f"❌ Error creating assignment: {str(e)}")
-        return TEACHER_MENU
+        try:
+            c.execute('''INSERT INTO assignments 
+                        (assignment_id, teacher_id, code, title, question, 
+                         question_type, max_score, grading_scale, created_at, answers, 
+                         required_fields, deadline_at, is_active)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                      (assignment_id, teacher_id, code, context.user_data.get('assign_title', ''),
+                       context.user_data.get('assign_question', ''), context.user_data.get('assign_type', 'Short Answer'),
+                       max_score, scale, datetime.now(), context.user_data.get('assign_answer', ''),
+                       required_fields_json, deadline_at, 1))
+            conn.commit()
+            
+            deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
+            required_str = ""
+            if required_fields:
+                required_str = f"\n📋 **Required Details:** {', '.join(required_fields)}"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
+            
+            await update.message.reply_text(
+                f"✅ **ASSIGNMENT CREATED!**\n\n"
+                f"📌 **Title:** {context.user_data.get('assign_title', '')}\n"
+                f"🔑 **Assignment Code:** `{code}`\n"
+                f"📊 **Max Score:** {max_score}/{scale}\n"
+                f"❓ **Question Type:** {context.user_data.get('assign_type', 'Short Answer')}"
+                f"{deadline_str}{required_str}\n\n"
+                f"Share the code with students so they can access this assignment!",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            
+            # Clear assignment data
+            context.user_data['assign_step'] = None
+            context.user_data['required_fields'] = []
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"❌ Error inserting assignment: {e}")
+            await update.message.reply_text(f"❌ Error creating assignment: {str(e)}")
+            return TEACHER_MENU
+    
+    finally:
+        close_db_connection(conn, c)
 
 async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View assignment details and submissions"""
@@ -2271,32 +2202,14 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # SIGNAL HANDLERS - GRACEFUL SHUTDOWN
 # ============================================================================
 
-def cleanup_db_pool():
-    """Cleanup database pool on shutdown"""
-    global DB_POOL
-    try:
-        if DB_POOL is not None:
-            DB_POOL.close()
-            logger.info("✅ Database pool closed gracefully")
-    except Exception as e:
-        logger.warning(f"⚠️ Error closing database pool: {e}")
-
-async def post_stop(app):
-    """Handle graceful shutdown"""
-    logger.info("🛑 Bot shutting down...")
-    cleanup_db_pool()
-    logger.info("✅ Shutdown complete")
-
 def on_sigterm(signum, frame):
     """Handle SIGTERM signal"""
     logger.info("📍 SIGTERM received, initiating shutdown...")
-    cleanup_db_pool()
     sys.exit(0)
 
 def on_sigint(signum, frame):
     """Handle SIGINT signal"""
     logger.info("📍 SIGINT received, initiating shutdown...")
-    cleanup_db_pool()
     sys.exit(0)
 
 # ============================================================================
@@ -2317,9 +2230,6 @@ def main():
     
     try:
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        
-        # Add post-stop callback
-        app.post_stop(post_stop)
         
         # Main conversation handler - EXPANDED
         conv_handler = ConversationHandler(
@@ -2413,21 +2323,15 @@ def main():
         logger.info("✅ FIXED: Navigation back buttons now working correctly!")
         logger.info("✅ FIXED: JSON database issues resolved!")
         logger.info("✅ FIXED: Help button now working!")
-        logger.info("✅ NEW: Connection pooling and improved error handling!")
         logger.info("\n📍 Waiting for users...\n")
         
         app.run_polling(allowed_updates=Update.ALL_TYPES)
     
     except Exception as e:
         logger.error(f"❌ Unexpected error during bot startup: {e}", exc_info=True)
-        cleanup_db_pool()
         raise
     except KeyboardInterrupt:
         logger.info("Bot interrupted by user")
-        cleanup_db_pool()
-    finally:
-        cleanup_db_pool()
-        logger.info("✅ Bot shutdown complete")
 
 if __name__ == "__main__":
     main()
