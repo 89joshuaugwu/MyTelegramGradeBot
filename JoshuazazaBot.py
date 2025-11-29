@@ -386,7 +386,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("👨‍🏫 Teacher Account", callback_data="teacher_mode")],
-        [InlineKeyboardButton("👨‍🎓 Student", callback_data="student_mode")]
+        [InlineKeyboardButton("👨‍🎓 Student", callback_data="student_mode")],
+        [InlineKeyboardButton("❓ Help", callback_data="show_help")]
     ]
     
     if teacher_info:
@@ -1155,6 +1156,135 @@ async def handle_edit_assign(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     return TEACHER_MENU
 
+async def handle_edit_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle edit title"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="my_assignments")]]
+    await query.edit_message_text(
+        "✏️ **EDIT TITLE**\n\n"
+        "Send the new title for this assignment:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    context.user_data['edit_mode'] = 'title'
+    return CREATE_QUESTION
+
+async def handle_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle edit question"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="my_assignments")]]
+    await query.edit_message_text(
+        "✏️ **EDIT QUESTION**\n\n"
+        "Send the new question text:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    context.user_data['edit_mode'] = 'question'
+    return CREATE_QUESTION
+
+async def handle_edit_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle edit answer"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="my_assignments")]]
+    await query.edit_message_text(
+        "✏️ **EDIT CORRECT ANSWER**\n\n"
+        "Send the new correct answer:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    context.user_data['edit_mode'] = 'answer'
+    return CREATE_QUESTION
+
+async def handle_edit_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle edit max score"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="my_assignments")]]
+    await query.edit_message_text(
+        "✏️ **EDIT MAX SCORE**\n\n"
+        "Send the new maximum score (e.g., 5, 10, 20, 100):",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    context.user_data['edit_mode'] = 'score'
+    return CREATE_QUESTION
+
+async def handle_edit_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle edit deadline"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [[InlineKeyboardButton("⏭️ No Deadline", callback_data="no_deadline")]]
+    await query.edit_message_text(
+        "✏️ **EDIT DEADLINE**\n\n"
+        "Send new deadline date and time:\n"
+        "`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`\n\n"
+        "_Example: 2025-12-15 or 2025-12-15 18:00_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    context.user_data['edit_mode'] = 'deadline'
+    return CREATE_QUESTION
+
+async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text input for edit fields (title, question, answer)"""
+    text = update.message.text.strip()
+    edit_mode = context.user_data.get('edit_mode')
+    assignment_id = context.user_data.get('edit_assign_id')
+    
+    if not assignment_id:
+        await update.message.reply_text("❌ Session error. Please try again.")
+        return TEACHER_MENU
+    
+    if edit_mode == 'title':
+        # Update title
+        conn = sqlite3.connect("exam_data.db")
+        c = conn.cursor()
+        c.execute('UPDATE assignments SET title=? WHERE assignment_id=?', (text, assignment_id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("✅ Title updated successfully!")
+        
+    elif edit_mode == 'question':
+        # Update question
+        conn = sqlite3.connect("exam_data.db")
+        c = conn.cursor()
+        c.execute('UPDATE assignments SET question=? WHERE assignment_id=?', (text, assignment_id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("✅ Question updated successfully!")
+        
+    elif edit_mode == 'answer':
+        # Update answer
+        conn = sqlite3.connect("exam_data.db")
+        c = conn.cursor()
+        c.execute('UPDATE assignments SET answers=? WHERE assignment_id=?', (text, assignment_id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("✅ Correct answer updated successfully!")
+        
+    elif edit_mode == 'score':
+        # Update max score
+        try:
+            score = int(text)
+            conn = sqlite3.connect("exam_data.db")
+            c = conn.cursor()
+            c.execute('UPDATE assignments SET max_score=? WHERE assignment_id=?', (score, assignment_id))
+            conn.commit()
+            conn.close()
+            await update.message.reply_text(f"✅ Max score updated to {score}!")
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number for max score")
+            return CREATE_QUESTION
+    
+    # Clear edit mode and return to menu
+    context.user_data['edit_mode'] = None
+    context.user_data['edit_assign_id'] = None
+    return TEACHER_MENU
+
 async def view_results_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View results and analytics for all student submissions"""
     query = update.callback_query
@@ -1622,114 +1752,250 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # HELP COMMAND HANDLER
 # ============================================================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show comprehensive help for all user types"""
+async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help from callback button"""
+    query = update.callback_query
+    await query.answer()
     
-    help_text = """
-🤖 **EXAM GRADING BOT - HELP GUIDE**
+    keyboard = [[InlineKeyboardButton("🔙 Back to Start", callback_data="back_to_start")]]
+    
+    help_text = get_comprehensive_help_text()
+    
+    # Split into chunks if too long (Telegram limit)
+    chunks = [help_text[i:i+4096] for i in range(0, len(help_text), 4096)]
+    
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            await query.edit_message_text(
+                chunk,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard) if i == len(chunks) - 1 else None
+            )
+        else:
+            await query.message.reply_text(
+                chunk,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard) if i == len(chunks) - 1 else None
+            )
+
+def get_comprehensive_help_text():
+    """Get comprehensive help text with detailed bot information"""
+    return """
+🤖 **ADVANCED TELEGRAM EXAM GRADING BOT v2.1**
 
 ═══════════════════════════════════════════════════════════════
 
-📚 **FOR TEACHERS** (Create & Grade Assignments)
+📊 **BOT OVERVIEW**
 
-✅ **Getting Started:**
-1. Click /start
-2. Select "Teacher Mode"
-3. Register with your name, email, and password
-4. Your account is ready!
+This is an intelligent examination and assignment management system designed for educators and students. Features include:
 
-✅ **Create Assignment:**
-1. Tap "Create Assignment" from menu
-2. Enter assignment name & instructions
-3. Choose question type:
-   • **Exact Match**: Answer must match exactly
-   • **Keyword Match**: Answer must contain keywords
-   • **Semantic**: AI checks meaning (flexible)
-   • **Manual Grade**: You grade manually later
-4. Add your question(s) and correct answer(s)
-5. Get a **unique 8-character code** to share
-
-✅ **Grade Student Answers:**
-1. Tap "View Results"
-2. See all student submissions
-3. For manual questions, enter a grade/score
-4. All responses are saved
-
-✅ **View Dashboard:**
-• Tap "Dashboard" to see all your assignments
-• Check student count and status
-• Track grading progress
-
-⏱️ **Logout When Done:**
-Tap "Logout" to securely exit
+✨ **Key Features:**
+• 🔐 Secure teacher accounts with password protection
+• 📝 Multiple question types with AI grading
+• ⏰ Assignment deadlines with automatic lockout
+• 👥 Student information collection (customizable fields)
+• 🎨 Color-coded score display (🟢🟡🔴)
+• 🤖 Google Gemini AI for semantic grading
+• 📊 Real-time analytics and results
+• ✏️ Edit assignments after creation
+• 🗑️ Delete assignments and manage submissions
 
 ═══════════════════════════════════════════════════════════════
 
-👨‍🎓 **FOR STUDENTS** (Answer & Get Grades)
+👨‍🏫 **FOR TEACHERS**
 
-✅ **Answer Assignment:**
-1. Click /start
-2. Select "Student Mode"
-3. Tap "Find Assignment"
-4. Enter the **8-character code** from your teacher
-5. Answer the questions
-6. Submit and wait for your grade!
+**🔑 Account & Login:**
+1. Click /start → Select "Teacher Account"
+2. Choose "Create New Account" or "Login"
+3. Register with: Full Name, Username, Password, Grading Scale
+4. Your account is secured and permanently saved
 
-✅ **View Your Grade:**
-• You'll see your grade immediately (if auto-graded)
-• Or wait for teacher to grade manually
-• You can try again with a new code
+**📝 Creating Assignments:**
+1. Click "Create Assignment" from menu
+2. Enter: Title → Question → Choose Type → Answer
+3. Set maximum score (e.g., 5, 10, 20, 100)
+4. Optional: Collect student details (Name, Phone, Email, ID, etc.)
+5. Optional: Set deadline (future date/time required)
+6. Get unique 8-character code to share with students
+
+**❓ Question Types:**
+• **Exact Match**: Student answer must match exactly (✅ Best for definitions)
+• **Keyword Based**: Answer must contain key terms (✅ Good for essays)
+• **AI Semantic**: Google Gemini AI evaluates meaning (✅ Most flexible)
+• **Short Answer**: Teacher grades manually (✅ For complex answers)
+
+**📋 Collecting Student Details:**
+• Choose which fields to collect: Name, Phone, Registration, Email, Gender, Class
+• Students MUST fill all required details before submitting
+• Details are stored with each submission for reference
+• View student info in assignment submission list
+
+**⏰ Setting Deadlines:**
+• Format: YYYY-MM-DD or YYYY-MM-DD HH:MM (e.g., 2025-12-15 18:00)
+• Must be a FUTURE date/time
+• Students automatically blocked after deadline
+• Prevents late submissions
+
+**📊 Managing Assignments:**
+• Click "My Assignments" to see all created assignments
+• 🟢 Green = Active | 🔴 Red = Expired deadline
+• Click assignment to view details and submissions
+• ✏️ Edit: Change title, question, answer, max score, deadline
+• 🗑️ Delete: Remove assignment and all student submissions
+
+**📈 Viewing Results:**
+• Click "Results & Analytics"
+• See submission count per assignment
+• View average scores
+• Check overall statistics
+
+**⚡ Quick Grade:**
+• One-off grading without creating assignments
+• Useful for quick assessments or demos
 
 ═══════════════════════════════════════════════════════════════
 
-⚡ **QUICK GRADING** (No Login Needed!)
+👨‍🎓 **FOR STUDENTS**
 
-✅ **Use Quick Grade Button:**
-1. Tap "Quick Grade" from main menu
-2. Select grading method (Exact/Keyword/Semantic)
-3. Enter question & correct answer
-4. Submit text to grade
-5. Get instant result!
+**🔍 Finding Assignments:**
+1. Click /start → Select "Student"
+2. Tap "Find Assignment"
+3. Enter 8-character code from your teacher
+4. See assignment details
 
-✅ **Perfect For:**
-• Testing single answers quickly
-• Grading without creating assignments
-• Demos & presentations
-• One-off assessments
+**📋 Required Information:**
+• If teacher set required fields, fill them FIRST
+• Answer questions one by one
+• Cannot skip required fields
+
+**✍️ Submitting Answers:**
+• Type your answer (text format)
+• Answer is auto-graded instantly (if using AI/Keyword/Exact)
+• Receive immediate score and feedback
+• Can attempt again with same code
+
+**📊 Your Score:**
+• 🟢 GREEN (80%+): Excellent
+• 🟡 YELLOW (60-80%): Good
+• 🔴 RED (<60%): Needs improvement
+
+**❌ Deadline Warning:**
+• ❌ Assignments closed after deadline
+• No late submissions allowed
+• Contact teacher if deadline issues
 
 ═══════════════════════════════════════════════════════════════
 
-🎮 **AVAILABLE COMMANDS**
+🔧 **TECHNICAL DETAILS**
 
-/start      - Restart the bot
-/help       - Show this help message
-/logout     - Logout from your account (Teachers)
+**Database:** SQLite3 (exam_data.db)
+**Tables:** teachers, assignments, submissions, quick_grades
+**AI Engine:** Google Gemini 2.0 Flash API
+**Language Model:** Sentence Transformers (Fallback)
+**Grading Methods:** Exact match, Keyword, Semantic similarity, Manual
+
+**Storage:**
+• Assignments: Title, Question, Type, Score, Deadline, Required Fields
+• Submissions: Student name, Answer, Score, Feedback, Student Details, Timestamp
+• Teachers: Username, Password, Name, Grading Scale
 
 ═══════════════════════════════════════════════════════════════
 
-❓ **TROUBLESHOOTING**
+⚙️ **SETTINGS & CUSTOMIZATION**
 
-**Can't find assignment?**
-→ Ask your teacher for the correct 8-character code
-→ Check that you copied it exactly
+**Teacher Grading Scale:**
+• Choose during account creation: 5, 10, 20, 30, or 100 points max
+• All assignments use your selected scale
 
-**Grade not showing?**
-→ Check if assignment uses manual grading
+**Question Types:**
+• Exact Match: Case-insensitive exact comparison
+• Keyword: Checks presence of key terms
+• Semantic: AI evaluates meaning and context
+• Short Answer: Manual teacher grading
+
+**Required Fields:**
+• Name, Phone, Registration Number, Email, Gender, Class/Grade
+• Select multiple or none during assignment creation
+• Students fill one field at a time
+
+═══════════════════════════════════════════════════════════════
+
+🚨 **TROUBLESHOOTING**
+
+**❓ "Assignment code not found"**
+→ Check code spelling and case (codes are uppercase)
+→ Ask teacher to verify code is correct
+→ Ensure assignment is active (not expired)
+
+**❌ "Deadline passed"**
+→ Assignment deadline has closed
+→ Contact teacher for extension or new assignment
+
+**🔐 "Forgot password"**
+→ Create new teacher account with /start
+→ Use different username
+
+**⚠️ "Session expired"**
+→ Log in again with /start
+→ Use your teacher username and password
+
+**📊 "Score not showing"**
+→ Check if using manual grading type
 → Teacher may not have graded yet
+→ Auto-graded types show instantly
 
-**Forgot password?**
-→ Use /start and register with a new account
-
-**Code doesn't work?**
-→ Code might be inactive
-→ Contact your teacher
+**🤖 "Gemini error"**
+→ AI grading temporarily unavailable
+→ System falls back to semantic similarity
+→ Answer will be graded with embeddings
 
 ═══════════════════════════════════════════════════════════════
 
-Need more help? Contact your teacher or bot administrator.
+📞 **SUPPORT**
+
+**Available Commands:**
+/start      - Begin or restart the bot
+/help       - Show this comprehensive guide
+/logout     - Logout from teacher account
+
+**For issues:**
+• Review "My Assignments" in teacher dashboard
+• Check submission list for student details
+• Verify deadline and required fields
+• Re-read assignment details for clarity
+
+═══════════════════════════════════════════════════════════════
+
+✅ **BOT STATUS: v2.1 - FULLY OPERATIONAL**
+
+All features working:
+✅ Teacher accounts & authentication
+✅ Dynamic question creation
+✅ Student details collection
+✅ Deadline enforcement
+✅ Color-coded scoring
+✅ Assignment editing
+✅ AI grading with Gemini
+✅ Fallback semantic grading
+✅ Real-time results
+✅ Quick grading mode
+
+═══════════════════════════════════════════════════════════════
+
+Thank you for using the Advanced Telegram Exam Grading Bot! 🎓
 """
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show comprehensive help via /help command"""
     
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    help_text = get_comprehensive_help_text()
+    
+    # Split into chunks if too long (Telegram limit is 4096 chars)
+    chunks = [help_text[i:i+4096] for i in range(0, len(help_text), 4096)]
+    
+    for i, chunk in enumerate(chunks):
+        await update.message.reply_text(chunk, parse_mode='Markdown')
+
 
 # ============================================================================
 
@@ -1754,6 +2020,7 @@ def main():
                 CallbackQueryHandler(teacher_mode_selector, pattern="^teacher_mode$"),
                 CallbackQueryHandler(direct_teacher_login, pattern="^teacher_login$"),
                 CallbackQueryHandler(student_mode, pattern="^student_mode$"),
+                CallbackQueryHandler(show_help_callback, pattern="^show_help$"),
             ],
             TEACHER_LOGIN: [
                 CallbackQueryHandler(proceed_teacher_login, pattern="^proceed_login$"),
@@ -1784,8 +2051,14 @@ def main():
                 CallbackQueryHandler(handle_fields_done, pattern="^fields_done$"),
                 CallbackQueryHandler(handle_proceed_deadline, pattern="^proceed_deadline$"),
                 CallbackQueryHandler(handle_no_deadline, pattern="^no_deadline$"),
+                CallbackQueryHandler(handle_edit_title, pattern="^edit_title_"),
+                CallbackQueryHandler(handle_edit_question, pattern="^edit_question_"),
+                CallbackQueryHandler(handle_edit_answer, pattern="^edit_answer_"),
+                CallbackQueryHandler(handle_edit_score, pattern="^edit_score_"),
+                CallbackQueryHandler(handle_edit_deadline, pattern="^edit_deadline_"),
                 CallbackQueryHandler(back_to_teacher_menu, pattern="^teacher_menu$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_assignment_creation),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
             ],
             STUDENT_MAIN: [
                 CallbackQueryHandler(find_assignment_start, pattern="^find_assignment$"),
