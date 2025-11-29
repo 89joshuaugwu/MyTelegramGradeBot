@@ -1,5 +1,5 @@
 # ============================================================================
-# ADVANCED TELEGRAM EXAM GRADING BOT v2 - WITH TEACHER ACCOUNTS
+# JOSHUAZAZA GRADE BOT v2.1 - WITH TEACHER ACCOUNTS
 # FIXED VERSION - POSTGRESQL MIGRATION + NAVIGATION FIXES
 # ============================================================================
 
@@ -14,17 +14,30 @@ from datetime import datetime, timedelta
 from PIL import Image
 import pytesseract
 
-# Use psycopg3 instead of psycopg2
+# Use psycopg3 with connection pooling
 try:
     import psycopg
+    from psycopg_pool import ConnectionPool
     PSYCOPG_AVAILABLE = True
+    USE_PSYCOPG3 = True
 except ImportError:
     # Fallback to psycopg2 if psycopg3 not available
     try:
         import psycopg2
         PSYCOPG_AVAILABLE = True
+        USE_PSYCOPG3 = False
     except ImportError:
         PSYCOPG_AVAILABLE = False
+        USE_PSYCOPG3 = False
+
+import logging
+
+# Configure logging for better error tracking
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -129,64 +142,150 @@ if os.name == "nt":
  EDIT_ASSIGNMENT, VIEW_SUBMISSION_DETAILS, STUDENT_FILL_DETAILS) = range(18)
 
 # ============================================================================
-# DATABASE SETUP - POSTGRESQL WITH TEACHER ACCOUNTS
+# DATABASE SETUP - POSTGRESQL WITH CONNECTION POOLING AND ERROR HANDLING
 # ============================================================================
 
-def get_db_connection():
-    """Get PostgreSQL database connection"""
+# Global connection pool - initialized on first use
+DB_POOL = None
+
+def init_db_pool():
+    """Initialize connection pool for efficient database access"""
+    global DB_POOL
+    if DB_POOL is not None:
+        return DB_POOL
+    
     try:
-        # Use psycopg3 if available, otherwise fallback to psycopg2
-        if 'psycopg' in sys.modules:
-            conn = psycopg.connect(DATABASE_URL)
+        if USE_PSYCOPG3:
+            DB_POOL = ConnectionPool(DATABASE_URL, open=False)
+            DB_POOL.open()
+            logger.info("✅ Database connection pool initialized successfully!")
         else:
-            import psycopg2
-            conn = psycopg2.connect(DATABASE_URL)
-        return conn
+            logger.warning("⚠️ Connection pooling only available with psycopg3. Using direct connections.")
+        return DB_POOL
     except Exception as e:
-        print(f"❌ Database connection error: {e}")
+        logger.error(f"❌ Failed to initialize connection pool: {e}")
         return None
+
+def get_db_connection(retry_count=3):
+    """Get PostgreSQL database connection with retry logic
+    
+    Args:
+        retry_count: Number of times to retry on connection failure
+    
+    Returns:
+        Connection object or None if failed
+    """
+    global DB_POOL
+    
+    # Try to use connection pool if available
+    if USE_PSYCOPG3 and DB_POOL is not None:
+        try:
+            conn = DB_POOL.getconn()
+            return conn
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to get connection from pool: {e}")
+    
+    # Fallback: direct connection with retry logic
+    for attempt in range(retry_count):
+        try:
+            if USE_PSYCOPG3:
+                conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
+            else:
+                import psycopg2
+                conn = psycopg2.connect(DATABASE_URL)
+            logger.debug(f"✅ Database connection established (attempt {attempt + 1})")
+            return conn
+        except Exception as e:
+            if attempt < retry_count - 1:
+                logger.warning(f"⚠️ Connection attempt {attempt + 1}/{retry_count} failed: {e}")
+                import time
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                logger.error(f"❌ All {retry_count} connection attempts failed: {e}")
+    
+    return None
+
+def close_db_connection(conn, cursor=None):
+    """Safely close database connection and cursor
+    
+    Args:
+        conn: Connection object to close
+        cursor: Optional cursor object to close
+    """
+    try:
+        if cursor:
+            cursor.close()
+    except Exception as e:
+        logger.warning(f"⚠️ Error closing cursor: {e}")
+    
+    try:
+        if conn:
+            # Return to pool if from pool, otherwise close
+            if USE_PSYCOPG3 and DB_POOL is not None:
+                try:
+                    DB_POOL.putconn(conn)
+                except:
+                    conn.close()
+            else:
+                conn.close()
+    except Exception as e:
+        logger.warning(f"⚠️ Error closing connection: {e}")
 
 def init_db():
     """Initialize PostgreSQL database with teacher accounts"""
-    conn = get_db_connection()
-    if not conn:
-        print("❌ Failed to connect to database")
-        return None
-    
-    c = conn.cursor()
-    
-    # Teachers table
-    c.execute('''CREATE TABLE IF NOT EXISTS teachers
-        (teacher_id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE, username TEXT UNIQUE,
-         password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
-    
-    # Questions/Assignments table - EXPANDED
-    c.execute('''CREATE TABLE IF NOT EXISTS assignments
-        (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
-         title TEXT, question TEXT, question_type TEXT, 
-         max_score INT, grading_scale INT, created_at TIMESTAMP, 
-         answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
-         required_fields JSONB, is_active INT DEFAULT 1,
-         FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
-    
-    # Student submissions - EXPANDED
-    c.execute('''CREATE TABLE IF NOT EXISTS submissions
-        (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
-         student_id BIGINT, answer TEXT, score REAL, max_score INT,
-         grading_details JSONB, submitted_at TIMESTAMP, student_details JSONB,
-         FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
-    
-    # Quick grading cache
-    c.execute('''CREATE TABLE IF NOT EXISTS quick_grades
-        (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
-         answer_given TEXT, score REAL, max_score INT,
-         graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
-    
-    conn.commit()
-    conn.close()
-    
-    print("✅ PostgreSQL database initialized successfully!")
-    return True
+    try:
+        # Initialize connection pool first
+        init_db_pool()
+        
+        conn = get_db_connection()
+        if not conn:
+            logger.error("❌ Failed to connect to database for initialization")
+            return False
+        
+        c = conn.cursor()
+        
+        try:
+            # Teachers table
+            c.execute('''CREATE TABLE IF NOT EXISTS teachers
+                (teacher_id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE, username TEXT UNIQUE,
+                 password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
+            
+            # Questions/Assignments table - EXPANDED
+            c.execute('''CREATE TABLE IF NOT EXISTS assignments
+                (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
+                 title TEXT, question TEXT, question_type TEXT, 
+                 max_score INT, grading_scale INT, created_at TIMESTAMP, 
+                 answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
+                 required_fields JSONB, is_active INT DEFAULT 1,
+                 FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+            
+            # Student submissions - EXPANDED
+            c.execute('''CREATE TABLE IF NOT EXISTS submissions
+                (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
+                 student_id BIGINT, answer TEXT, score REAL, max_score INT,
+                 grading_details JSONB, submitted_at TIMESTAMP, student_details JSONB,
+                 FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
+            
+            # Quick grading cache
+            c.execute('''CREATE TABLE IF NOT EXISTS quick_grades
+                (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
+                 answer_given TEXT, score REAL, max_score INT,
+                 graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+            
+            conn.commit()
+            logger.info("✅ PostgreSQL database initialized successfully!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Database initialization error: {e}")
+            conn.rollback()
+            return False
+        finally:
+            close_db_connection(conn, c)
+            
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during database initialization: {e}")
+        return False
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -201,54 +300,70 @@ def generate_assignment_code():
     return str(uuid.uuid4())[:8].upper()
 
 def register_teacher(telegram_id, username, password, full_name, grading_scale=100):
-    """Register new teacher"""
+    """Register new teacher with improved error handling"""
     conn = get_db_connection()
     if not conn:
+        logger.error(f"Failed to register teacher {username}: database connection failed")
         return False, None
     
-    c = conn.cursor()
-    
+    c = None
     try:
+        c = conn.cursor()
         hashed_pass = hash_password(password)
         c.execute('''INSERT INTO teachers (telegram_id, username, password, full_name, grading_scale, created_at)
                      VALUES (%s, %s, %s, %s, %s, %s) RETURNING teacher_id''',
                   (telegram_id, username, hashed_pass, full_name, grading_scale, datetime.now()))
         teacher_id = c.fetchone()[0]
         conn.commit()
+        logger.info(f"✅ Teacher {username} (ID: {teacher_id}) registered successfully")
         return True, teacher_id
     except Exception as e:
-        print(f"Registration error: {e}")
+        conn.rollback()
+        logger.error(f"❌ Registration error for {username}: {e}")
         return False, None
     finally:
-        conn.close()
+        close_db_connection(conn, c)
 
 def login_teacher(username, password):
-    """Login teacher and return teacher_id"""
+    """Login teacher and return teacher_id with improved error handling"""
     conn = get_db_connection()
     if not conn:
+        logger.error(f"Failed to login teacher {username}: database connection failed")
         return None, None
     
-    c = conn.cursor()
-    
-    hashed_pass = hash_password(password)
-    c.execute("SELECT teacher_id, full_name FROM teachers WHERE username=%s AND password=%s",
-              (username, hashed_pass))
-    result = c.fetchone()
-    conn.close()
-    
-    return result if result else (None, None)
+    c = None
+    try:
+        c = conn.cursor()
+        hashed_pass = hash_password(password)
+        c.execute("SELECT teacher_id, full_name FROM teachers WHERE username=%s AND password=%s",
+                  (username, hashed_pass))
+        result = c.fetchone()
+        logger.info(f"✅ Teacher {username} logged in successfully" if result else f"⚠️ Login failed for {username}")
+        return result if result else (None, None)
+    except Exception as e:
+        logger.error(f"❌ Login error for {username}: {e}")
+        return None, None
+    finally:
+        close_db_connection(conn, c)
 
 def teacher_exists_by_telegram(telegram_id):
-    """Check if teacher account exists"""
+    """Check if teacher account exists with improved error handling"""
     conn = get_db_connection()
     if not conn:
+        logger.error(f"Failed to check teacher {telegram_id}: database connection failed")
         return None
     
-    c = conn.cursor()
-    c.execute("SELECT teacher_id, full_name FROM teachers WHERE telegram_id=%s", (telegram_id,))
-    result = c.fetchone()
-    conn.close()
-    return result
+    c = None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT teacher_id, full_name FROM teachers WHERE telegram_id=%s", (telegram_id,))
+        result = c.fetchone()
+        return result
+    except Exception as e:
+        logger.error(f"❌ Error checking teacher {telegram_id}: {e}")
+        return None
+    finally:
+        close_db_connection(conn, c)
 
 def normalize_text(s):
     """Normalize text"""
@@ -1850,7 +1965,7 @@ async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     
     await query.edit_message_text(
-        "👋 **Back to Start**\n\n"
+        "👋 Back to Start\n\n"
         "Type /start to begin again"
     )
     return START
@@ -1874,7 +1989,7 @@ async def back_to_student_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     
     await query.edit_message_text(
-        "👨‍🎓 **STUDENT PORTAL**\n\n"
+        "👨‍🎓 STUDENT PORTAL\n\n"
         "What would you like to do?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -1890,7 +2005,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     
     await query.edit_message_text(
-        "👋 **Logged out successfully!**\n\n"
+        "👋 Logged out successfully!\n\n"
         "Type /start to login again"
     )
     return START
@@ -1930,7 +2045,7 @@ async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def get_comprehensive_help_text():
     """Get comprehensive help text with detailed bot information"""
     return """
-🤖 **ADVANCED TELEGRAM EXAM GRADING BOT v2.1**
+🤖 **JOSHUAZAZA GRADE BOT v2.1**
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2032,21 +2147,6 @@ This is an intelligent examination and assignment management system designed for
 • ❌ Assignments closed after deadline
 • No late submissions allowed
 • Contact teacher if deadline issues
-
-═══════════════════════════════════════════════════════════════
-
-🔧 **TECHNICAL DETAILS**
-
-**Database:** PostgreSQL (Render Cloud)
-**Tables:** teachers, assignments, submissions, quick_grades
-**AI Engine:** Google Gemini 2.0 Flash API
-**Language Model:** Sentence Transformers (Fallback)
-**Grading Methods:** Exact match, Keyword, Semantic similarity, Manual
-
-**Storage:**
-• Assignments: Title, Question, Type, Score, Deadline, Required Fields
-• Submissions: Student name, Answer, Score, Feedback, Student Details, Timestamp
-• Teachers: Username, Password, Name, Grading Scale
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2153,32 +2253,74 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error: {context.error}")
 
 # ============================================================================
+# SIGNAL HANDLERS - GRACEFUL SHUTDOWN
+# ============================================================================
+
+def cleanup_db_pool():
+    """Cleanup database pool on shutdown"""
+    global DB_POOL
+    try:
+        if DB_POOL is not None:
+            DB_POOL.close()
+            logger.info("✅ Database pool closed gracefully")
+    except Exception as e:
+        logger.warning(f"⚠️ Error closing database pool: {e}")
+
+async def post_stop(app):
+    """Handle graceful shutdown"""
+    logger.info("🛑 Bot shutting down...")
+    cleanup_db_pool()
+    logger.info("✅ Shutdown complete")
+
+def on_sigterm(signum, frame):
+    """Handle SIGTERM signal"""
+    logger.info("📍 SIGTERM received, initiating shutdown...")
+    cleanup_db_pool()
+    sys.exit(0)
+
+def on_sigint(signum, frame):
+    """Handle SIGINT signal"""
+    logger.info("📍 SIGINT received, initiating shutdown...")
+    cleanup_db_pool()
+    sys.exit(0)
+
+# ============================================================================
 # MAIN - BOT SETUP - FIXED CONVERSATION HANDLER
 # ============================================================================
 
 def main():
     """Initialize and run bot"""
+    import signal
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, on_sigterm)
+    signal.signal(signal.SIGINT, on_sigint)
+    
     if not init_db():
-        print("❌ Failed to initialize database. Exiting.")
+        logger.error("❌ Failed to initialize database. Exiting.")
         return
     
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    
-    # Main conversation handler - EXPANDED
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            START: [
-                CallbackQueryHandler(teacher_mode_selector, pattern="^teacher_mode$"),
-                CallbackQueryHandler(direct_teacher_login, pattern="^teacher_login$"),
-                CallbackQueryHandler(student_mode, pattern="^student_mode$"),
-                CallbackQueryHandler(show_help_callback, pattern="^show_help$"),
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
-            ],
-            TEACHER_LOGIN: [
-                CallbackQueryHandler(proceed_teacher_login, pattern="^proceed_login$"),
-                CallbackQueryHandler(proceed_teacher_register, pattern="^proceed_register$"),
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
+    try:
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        
+        # Add post-stop callback
+        app.post_stop(post_stop)
+        
+        # Main conversation handler - EXPANDED
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={
+                START: [
+                    CallbackQueryHandler(teacher_mode_selector, pattern="^teacher_mode$"),
+                    CallbackQueryHandler(direct_teacher_login, pattern="^teacher_login$"),
+                    CallbackQueryHandler(student_mode, pattern="^student_mode$"),
+                    CallbackQueryHandler(show_help_callback, pattern="^show_help$"),
+                    CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
+                ],
+                TEACHER_LOGIN: [
+                    CallbackQueryHandler(proceed_teacher_login, pattern="^proceed_login$"),
+                    CallbackQueryHandler(proceed_teacher_register, pattern="^proceed_register$"),
+                    CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_teacher_auth),
             ],
             TEACHER_REGISTER: [
@@ -2244,21 +2386,33 @@ def main():
         fallbacks=[CommandHandler("start", start), CommandHandler("help", help_command)],
     )
     
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conv_handler)
-    app.add_error_handler(error_handler)
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(conv_handler)
+        app.add_error_handler(error_handler)
+        
+        logger.info("🚀 Advanced Exam Grading Bot v2 is ONLINE!")
+        logger.info("✅ Features: Teacher Accounts | Dynamic Questions | Student Answers")
+        logger.info("✅ Features: Quick Grading | Customizable Scales | Proper Navigation")
+        logger.info("✅ FIXED: PostgreSQL Database | Teacher login now working properly!")
+        logger.info("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
+        logger.info("✅ FIXED: Navigation back buttons now working correctly!")
+        logger.info("✅ FIXED: JSON database issues resolved!")
+        logger.info("✅ FIXED: Help button now working!")
+        logger.info("✅ NEW: Connection pooling and improved error handling!")
+        logger.info("\n📍 Waiting for users...\n")
+        
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
     
-    print("🚀 Advanced Exam Grading Bot v2 is ONLINE!")
-    print("✅ Features: Teacher Accounts | Dynamic Questions | Student Answers")
-    print("✅ Features: Quick Grading | Customizable Scales | Proper Navigation")
-    print("✅ FIXED: PostgreSQL Database | Teacher login now working properly!")
-    print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
-    print("✅ FIXED: Navigation back buttons now working correctly!")
-    print("✅ FIXED: JSON database issues resolved!")
-    print("✅ FIXED: Help button now working!")
-    print("\n📍 Waiting for users...\n")
-    
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during bot startup: {e}", exc_info=True)
+        cleanup_db_pool()
+        raise
+    except KeyboardInterrupt:
+        logger.info("Bot interrupted by user")
+        cleanup_db_pool()
+    finally:
+        cleanup_db_pool()
+        logger.info("✅ Bot shutdown complete")
 
 if __name__ == "__main__":
     main()
