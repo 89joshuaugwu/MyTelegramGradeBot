@@ -1,6 +1,6 @@
 # ============================================================================
 # ADVANCED TELEGRAM EXAM GRADING BOT v2 - WITH TEACHER ACCOUNTS
-# FIXED VERSION - POSTGRESQL MIGRATION + NAVIGATION FIXES
+# FIXED VERSION - TEACHER LOGIN ISSUE RESOLVED
 # ============================================================================
 
 import os
@@ -8,29 +8,12 @@ import re
 import sys
 import json
 import hashlib
+import sqlite3
 import uuid
 from io import BytesIO
 from datetime import datetime, timedelta
 from PIL import Image
 import pytesseract
-
-# Use psycopg[binary] for database connections (psycopg 3 with psycopg2 compatibility)
-try:
-    import psycopg
-    # Enable psycopg2 compatibility
-    import psycopg2
-    PSYCOPG_AVAILABLE = True
-except ImportError:
-    PSYCOPG_AVAILABLE = False
-
-import logging
-
-# Configure logging for better error tracking
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -38,6 +21,9 @@ from telegram.ext import (
     ContextTypes, ConversationHandler, CallbackQueryHandler, CallbackContext
 )
 from dotenv import load_dotenv
+
+# Fix deprecation warning for Python 3.12+ SQLite datetime
+sqlite3.register_adapter(datetime, lambda val: val.isoformat() if val else None)
 
 # NLP & AI
 try:
@@ -101,15 +87,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# PostgreSQL Database URL from Render
-DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not TELEGRAM_TOKEN:
     print("❌ ERROR: TELEGRAM_TOKEN missing in .env file!")
-    sys.exit(1)
-
-if not DATABASE_URL:
-    print("❌ ERROR: DATABASE_URL missing in environment variables!")
     sys.exit(1)
 
 # Initialize Gemini if API key available
@@ -135,85 +114,66 @@ if os.name == "nt":
  EDIT_ASSIGNMENT, VIEW_SUBMISSION_DETAILS, STUDENT_FILL_DETAILS) = range(18)
 
 # ============================================================================
-# DATABASE SETUP - POSTGRESQL WITH ERROR HANDLING
+# DATABASE SETUP - ENHANCED WITH TEACHER ACCOUNTS
 # ============================================================================
 
-def get_db_connection():
-    """Get PostgreSQL database connection"""
+def init_db():
+    """Initialize SQLite database with teacher accounts"""
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    
+    # Teachers table
+    c.execute('''CREATE TABLE IF NOT EXISTS teachers
+        (teacher_id INTEGER PRIMARY KEY, telegram_id INT UNIQUE, username TEXT UNIQUE,
+         password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
+    
+    # Questions/Assignments table - EXPANDED
+    c.execute('''CREATE TABLE IF NOT EXISTS assignments
+        (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
+         title TEXT, question TEXT, question_type TEXT, 
+         max_score INT, grading_scale INT, created_at TIMESTAMP, 
+         answers JSON, rubric JSON, deadline_at TIMESTAMP, 
+         required_fields JSON, is_active INT DEFAULT 1,
+         FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+    
+    # Student submissions - EXPANDED
+    c.execute('''CREATE TABLE IF NOT EXISTS submissions
+        (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
+         student_id INT, answer TEXT, score REAL, max_score INT,
+         grading_details JSON, submitted_at TIMESTAMP, student_details JSON,
+         FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
+    
+    # Quick grading cache
+    c.execute('''CREATE TABLE IF NOT EXISTS quick_grades
+        (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
+         answer_given TEXT, score REAL, max_score INT,
+         graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+    
+    conn.commit()
+    
+    # ADD MISSING COLUMNS TO EXISTING TABLES (for migration from old schema)
     try:
-        import psycopg2
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except Exception as e:
-        logger.error(f"❌ Database connection error: {e}")
-        return None
-
-def close_db_connection(conn, cursor=None):
-    """Safely close database connection and cursor"""
-    try:
-        if cursor:
-            cursor.close()
-    except Exception as e:
-        logger.warning(f"⚠️ Error closing cursor: {e}")
+        c.execute("ALTER TABLE assignments ADD COLUMN deadline_at TIMESTAMP")
+    except:
+        pass
     
     try:
-        if conn:
-            conn.close()
-    except Exception as e:
-        logger.warning(f"⚠️ Error closing connection: {e}")
-
-def init_db():
-    """Initialize PostgreSQL database with teacher accounts"""
+        c.execute("ALTER TABLE assignments ADD COLUMN required_fields JSON")
+    except:
+        pass
+    
     try:
-        conn = get_db_connection()
-        if not conn:
-            logger.error("❌ Failed to connect to database for initialization")
-            return False
-        
-        c = conn.cursor()
-        
-        try:
-            # Teachers table
-            c.execute('''CREATE TABLE IF NOT EXISTS teachers
-                (teacher_id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE, username TEXT UNIQUE,
-                 password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
-            
-            # Questions/Assignments table - EXPANDED
-            c.execute('''CREATE TABLE IF NOT EXISTS assignments
-                (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
-                 title TEXT, question TEXT, question_type TEXT, 
-                 max_score INT, grading_scale INT, created_at TIMESTAMP, 
-                 answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
-                 required_fields JSONB, is_active INT DEFAULT 1,
-                 FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
-            
-            # Student submissions - EXPANDED
-            c.execute('''CREATE TABLE IF NOT EXISTS submissions
-                (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
-                 student_id BIGINT, answer TEXT, score REAL, max_score INT,
-                 grading_details JSONB, submitted_at TIMESTAMP, student_details JSONB,
-                 FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
-            
-            # Quick grading cache
-            c.execute('''CREATE TABLE IF NOT EXISTS quick_grades
-                (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
-                 answer_given TEXT, score REAL, max_score INT,
-                 graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
-            
-            conn.commit()
-            logger.info("✅ PostgreSQL database initialized successfully!")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Database initialization error: {e}")
-            conn.rollback()
-            return False
-        finally:
-            close_db_connection(conn, c)
-            
-    except Exception as e:
-        logger.error(f"❌ Unexpected error during database initialization: {e}")
-        return False
+        c.execute("ALTER TABLE assignments ADD COLUMN is_active INT DEFAULT 1")
+    except:
+        pass
+    
+    try:
+        c.execute("ALTER TABLE submissions ADD COLUMN student_details JSON")
+    except:
+        pass
+    
+    conn.commit()
+    return conn
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -228,70 +188,44 @@ def generate_assignment_code():
     return str(uuid.uuid4())[:8].upper()
 
 def register_teacher(telegram_id, username, password, full_name, grading_scale=100):
-    """Register new teacher with improved error handling"""
-    conn = get_db_connection()
-    if not conn:
-        logger.error(f"Failed to register teacher {username}: database connection failed")
-        return False, None
+    """Register new teacher"""
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
     
-    c = None
     try:
-        c = conn.cursor()
         hashed_pass = hash_password(password)
         c.execute('''INSERT INTO teachers (telegram_id, username, password, full_name, grading_scale, created_at)
-                     VALUES (%s, %s, %s, %s, %s, %s) RETURNING teacher_id''',
+                     VALUES (?, ?, ?, ?, ?, ?)''',
                   (telegram_id, username, hashed_pass, full_name, grading_scale, datetime.now()))
-        teacher_id = c.fetchone()[0]
         conn.commit()
-        logger.info(f"✅ Teacher {username} (ID: {teacher_id}) registered successfully")
+        teacher_id = c.lastrowid
         return True, teacher_id
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"❌ Registration error for {username}: {e}")
+    except sqlite3.IntegrityError:
         return False, None
     finally:
-        close_db_connection(conn, c)
+        conn.close()
 
 def login_teacher(username, password):
-    """Login teacher and return teacher_id with improved error handling"""
-    conn = get_db_connection()
-    if not conn:
-        logger.error(f"Failed to login teacher {username}: database connection failed")
-        return None, None
+    """Login teacher and return teacher_id"""
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
     
-    c = None
-    try:
-        c = conn.cursor()
-        hashed_pass = hash_password(password)
-        c.execute("SELECT teacher_id, full_name FROM teachers WHERE username=%s AND password=%s",
-                  (username, hashed_pass))
-        result = c.fetchone()
-        logger.info(f"✅ Teacher {username} logged in successfully" if result else f"⚠️ Login failed for {username}")
-        return result if result else (None, None)
-    except Exception as e:
-        logger.error(f"❌ Login error for {username}: {e}")
-        return None, None
-    finally:
-        close_db_connection(conn, c)
+    hashed_pass = hash_password(password)
+    c.execute("SELECT teacher_id, full_name FROM teachers WHERE username=? AND password=?",
+              (username, hashed_pass))
+    result = c.fetchone()
+    conn.close()
+    
+    return result if result else (None, None)
 
 def teacher_exists_by_telegram(telegram_id):
-    """Check if teacher account exists with improved error handling"""
-    conn = get_db_connection()
-    if not conn:
-        logger.error(f"Failed to check teacher {telegram_id}: database connection failed")
-        return None
-    
-    c = None
-    try:
-        c = conn.cursor()
-        c.execute("SELECT teacher_id, full_name FROM teachers WHERE telegram_id=%s", (telegram_id,))
-        result = c.fetchone()
-        return result
-    except Exception as e:
-        logger.error(f"❌ Error checking teacher {telegram_id}: {e}")
-        return None
-    finally:
-        close_db_connection(conn, c)
+    """Check if teacher account exists"""
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    c.execute("SELECT teacher_id, full_name FROM teachers WHERE telegram_id=?", (telegram_id,))
+    result = c.fetchone()
+    conn.close()
+    return result
 
 def normalize_text(s):
     """Normalize text"""
@@ -317,14 +251,14 @@ def is_assignment_expired(deadline_at):
     """Check if assignment deadline has passed"""
     if not deadline_at:
         return False
-    deadline = deadline_at if isinstance(deadline_at, datetime) else datetime.fromisoformat(deadline_at)
+    deadline = datetime.fromisoformat(deadline_at) if isinstance(deadline_at, str) else deadline_at
     return datetime.now() > deadline
 
 def get_deadline_string(deadline_at):
     """Format deadline for display"""
     if not deadline_at:
         return "No deadline"
-    deadline = deadline_at if isinstance(deadline_at, datetime) else datetime.fromisoformat(deadline_at)
+    deadline = datetime.fromisoformat(deadline_at) if isinstance(deadline_at, str) else deadline_at
     return deadline.strftime("%B %d, %Y at %I:%M %p")
 
 def ocr_from_image_bytes(image_bytes):
@@ -751,73 +685,51 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
     max_score = context.user_data.get('assign_max_score')
     
     # Get teacher's grading scale
-    conn = get_db_connection()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error. Please try again.")
-        return TEACHER_MENU
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    c.execute("SELECT grading_scale FROM teachers WHERE teacher_id=?", (teacher_id,))
+    scale = c.fetchone()[0]
     
-    try:
-        c = conn.cursor()
-        c.execute("SELECT grading_scale FROM teachers WHERE teacher_id=%s", (teacher_id,))
-        result = c.fetchone()
-        if not result:
-            await update.message.reply_text("❌ Teacher not found.")
-            return TEACHER_MENU
-        scale = result[0]
-        
-        # Create assignment
-        assignment_id = str(uuid.uuid4())
-        code = generate_assignment_code()
-        
-        # FIX: Properly format required_fields as JSON
-        required_fields = context.user_data.get('required_fields', [])
-        required_fields_json = json.dumps(required_fields) if required_fields else json.dumps([])
-        
-        deadline_at = context.user_data.get('assign_deadline')
-        
-        try:
-            c.execute('''INSERT INTO assignments 
-                        (assignment_id, teacher_id, code, title, question, 
-                         question_type, max_score, grading_scale, created_at, answers, 
-                         required_fields, deadline_at, is_active)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                      (assignment_id, teacher_id, code, context.user_data.get('assign_title', ''),
-                       context.user_data.get('assign_question', ''), context.user_data.get('assign_type', 'Short Answer'),
-                       max_score, scale, datetime.now(), context.user_data.get('assign_answer', ''),
-                       required_fields_json, deadline_at, 1))
-            conn.commit()
-            
-            deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
-            required_str = ""
-            if required_fields:
-                required_str = f"\n📋 **Required Details:** {', '.join(required_fields)}"
-            
-            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
-            
-            await update.message.reply_text(
-                f"✅ **ASSIGNMENT CREATED!**\n\n"
-                f"📌 **Title:** {context.user_data.get('assign_title', '')}\n"
-                f"🔑 **Assignment Code:** `{code}`\n"
-                f"📊 **Max Score:** {max_score}/{scale}\n"
-                f"❓ **Question Type:** {context.user_data.get('assign_type', 'Short Answer')}"
-                f"{deadline_str}{required_str}\n\n"
-                f"Share the code with students so they can access this assignment!",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-            
-            # Clear assignment data
-            context.user_data['assign_step'] = None
-            context.user_data['required_fields'] = []
-            
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"❌ Error inserting assignment: {e}")
-            await update.message.reply_text(f"❌ Error creating assignment: {str(e)}")
-            return TEACHER_MENU
+    # Create assignment
+    assignment_id = str(uuid.uuid4())
+    code = generate_assignment_code()
+    required_fields = json.dumps(context.user_data.get('required_fields', []))
+    deadline_at = context.user_data.get('assign_deadline')
     
-    finally:
-        close_db_connection(conn, c)
+    c.execute('''INSERT INTO assignments 
+                (assignment_id, teacher_id, code, title, question, 
+                 question_type, max_score, grading_scale, created_at, answers, 
+                 required_fields, deadline_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (assignment_id, teacher_id, code, context.user_data['assign_title'],
+               context.user_data['assign_question'], context.user_data['assign_type'],
+               max_score, scale, datetime.now(), context.user_data['assign_answer'],
+               required_fields, deadline_at, 1))
+    conn.commit()
+    conn.close()
+    
+    deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
+    required_str = ""
+    if context.user_data.get('required_fields'):
+        required_str = f"\n📋 **Required Details:** {', '.join(context.user_data['required_fields'])}"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
+    
+    await update.message.reply_text(
+        f"✅ **ASSIGNMENT CREATED!**\n\n"
+        f"📌 **Title:** {context.user_data['assign_title']}\n"
+        f"🔑 **Assignment Code:** `{code}`\n"
+        f"📊 **Max Score:** {max_score}/{scale}\n"
+        f"❓ **Question Type:** {context.user_data['assign_type']}"
+        f"{deadline_str}{required_str}\n\n"
+        f"Share the code with students so they can access this assignment!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    # Clear assignment data
+    context.user_data['assign_step'] = None
+    context.user_data['required_fields'] = []
 
 async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View assignment details and submissions"""
@@ -830,22 +742,17 @@ async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAU
     
     teacher_id = context.user_data.get('teacher_id')
     
-    conn = get_db_connection()
-    if not conn:
-        await query.edit_message_text("❌ Database connection error.")
-        return TEACHER_MENU
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
     # Get assignment details
     c.execute('''SELECT assignment_id, code, title, question, question_type, max_score, 
                         deadline_at, required_fields, created_at, is_active
                  FROM assignments 
-                 WHERE teacher_id=%s AND assignment_id LIKE %s''', 
+                 WHERE teacher_id=? AND assignment_id LIKE ?''', 
               (teacher_id, f"{assign_id_prefix}%"))
     assign = c.fetchone()
     
     if not assign:
-        conn.close()
         await query.edit_message_text("❌ Assignment not found.")
         return TEACHER_MENU
     
@@ -854,7 +761,7 @@ async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAU
     # Get all submissions
     c.execute('''SELECT submission_id, student_name, student_id, answer, score, max_score, submitted_at, student_details
                  FROM submissions 
-                 WHERE assignment_id=%s
+                 WHERE assignment_id=?
                  ORDER BY submitted_at DESC''', (assignment_id,))
     submissions = c.fetchall()
     conn.close()
@@ -1112,31 +1019,13 @@ async def handle_proceed_deadline(update: Update, context: ContextTypes.DEFAULT_
     return CREATE_QUESTION
 
 async def handle_no_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Skip deadline setup - FIXED VERSION"""
+    """Skip deadline setup"""
     query = update.callback_query
     await query.answer()
     
     context.user_data['assign_deadline'] = None
     teacher_id = context.user_data.get('teacher_id')
-    
-    # Use the message from the query to finalize assignment
-    if hasattr(update, 'message') and update.message:
-        await finalize_assignment(update, context, teacher_id)
-    else:
-        # If called from callback, we need to send a message first
-        await query.edit_message_text("Finalizing assignment without deadline...")
-        # Create a mock update with message for finalize_assignment
-        class MockMessage:
-            async def reply_text(self, text, **kwargs):
-                return await query.message.reply_text(text, **kwargs)
-        
-        class MockUpdate:
-            def __init__(self, query):
-                self.message = MockMessage()
-        
-        mock_update = MockUpdate(query)
-        await finalize_assignment(mock_update, context, teacher_id)
-    
+    await finalize_assignment(update, context, teacher_id)
     return TEACHER_MENU
 
 async def view_my_assignments(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1149,19 +1038,15 @@ async def view_my_assignments(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Session expired. Please login again.")
         return TEACHER_MENU
     
-    conn = get_db_connection()
-    if not conn:
-        await query.edit_message_text("❌ Database connection error.")
-        return TEACHER_MENU
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
     # Get assignments with submission counts
     c.execute('''SELECT a.assignment_id, a.code, a.title, a.question_type, a.max_score, a.created_at,
                         a.deadline_at, COUNT(s.submission_id) as submission_count
                  FROM assignments a
                  LEFT JOIN submissions s ON a.assignment_id = s.assignment_id
-                 WHERE a.teacher_id=%s
-                 GROUP BY a.assignment_id, a.code, a.title, a.question_type, a.max_score, a.created_at, a.deadline_at
+                 WHERE a.teacher_id=?
+                 GROUP BY a.assignment_id
                  ORDER BY a.created_at DESC''', (teacher_id,))
     assignments = c.fetchall()
     conn.close()
@@ -1206,13 +1091,9 @@ async def handle_deactivate_assign(update: Update, context: ContextTypes.DEFAULT
     action = query.data.replace("activate_assign", "").replace("deactivate_assign", "")
     is_active = 0 if "deactivate" in query.data else 1
     
-    conn = get_db_connection()
-    if not conn:
-        await query.edit_message_text("❌ Database connection error.")
-        return TEACHER_MENU
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
-    c.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (is_active, assignment_id))
+    c.execute('UPDATE assignments SET is_active=? WHERE assignment_id=?', (is_active, assignment_id))
     conn.commit()
     conn.close()
     
@@ -1228,16 +1109,12 @@ async def handle_delete_assign(update: Update, context: ContextTypes.DEFAULT_TYP
     
     assignment_id = context.user_data.get('edit_assign_id')
     
-    conn = get_db_connection()
-    if not conn:
-        await query.edit_message_text("❌ Database connection error.")
-        return TEACHER_MENU
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
     # Delete related submissions first
-    c.execute('DELETE FROM submissions WHERE assignment_id=%s', (assignment_id,))
+    c.execute('DELETE FROM submissions WHERE assignment_id=?', (assignment_id,))
     # Then delete assignment
-    c.execute('DELETE FROM assignments WHERE assignment_id=%s', (assignment_id,))
+    c.execute('DELETE FROM assignments WHERE assignment_id=?', (assignment_id,))
     conn.commit()
     conn.close()
     
@@ -1256,14 +1133,10 @@ async def handle_edit_assign(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     assignment_id = context.user_data.get('edit_assign_id')
     
-    conn = get_db_connection()
-    if not conn:
-        await query.edit_message_text("❌ Database connection error.")
-        return TEACHER_MENU
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
     c.execute('''SELECT title, question, answers, max_score, deadline_at, required_fields, is_active
-                 FROM assignments WHERE assignment_id=%s''', (assignment_id,))
+                 FROM assignments WHERE assignment_id=?''', (assignment_id,))
     assign = c.fetchone()
     conn.close()
     
@@ -1371,7 +1244,7 @@ async def handle_edit_deadline(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     
-    keyboard = [[InlineKeyboardButton("⏭️ No Deadline", callback_data="no_deadline_edit")]]
+    keyboard = [[InlineKeyboardButton("⏭️ No Deadline", callback_data="no_deadline")]]
     await query.edit_message_text(
         "✏️ **EDIT DEADLINE**\n\n"
         "Send new deadline date and time:\n"
@@ -1393,64 +1266,46 @@ async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Session error. Please try again.")
         return TEACHER_MENU
     
-    conn = get_db_connection()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error.")
-        return TEACHER_MENU
-    
-    c = conn.cursor()
-    
     if edit_mode == 'title':
         # Update title
-        c.execute('UPDATE assignments SET title=%s WHERE assignment_id=%s', (text, assignment_id))
+        conn = sqlite3.connect("exam_data.db")
+        c = conn.cursor()
+        c.execute('UPDATE assignments SET title=? WHERE assignment_id=?', (text, assignment_id))
         conn.commit()
+        conn.close()
         await update.message.reply_text("✅ Title updated successfully!")
         
     elif edit_mode == 'question':
         # Update question
-        c.execute('UPDATE assignments SET question=%s WHERE assignment_id=%s', (text, assignment_id))
+        conn = sqlite3.connect("exam_data.db")
+        c = conn.cursor()
+        c.execute('UPDATE assignments SET question=? WHERE assignment_id=?', (text, assignment_id))
         conn.commit()
+        conn.close()
         await update.message.reply_text("✅ Question updated successfully!")
         
     elif edit_mode == 'answer':
         # Update answer
-        c.execute('UPDATE assignments SET answers=%s WHERE assignment_id=%s', (text, assignment_id))
+        conn = sqlite3.connect("exam_data.db")
+        c = conn.cursor()
+        c.execute('UPDATE assignments SET answers=? WHERE assignment_id=?', (text, assignment_id))
         conn.commit()
+        conn.close()
         await update.message.reply_text("✅ Correct answer updated successfully!")
         
     elif edit_mode == 'score':
         # Update max score
         try:
             score = int(text)
-            c.execute('UPDATE assignments SET max_score=%s WHERE assignment_id=%s', (score, assignment_id))
+            conn = sqlite3.connect("exam_data.db")
+            c = conn.cursor()
+            c.execute('UPDATE assignments SET max_score=? WHERE assignment_id=?', (score, assignment_id))
             conn.commit()
+            conn.close()
             await update.message.reply_text(f"✅ Max score updated to {score}!")
         except ValueError:
             await update.message.reply_text("❌ Please enter a valid number for max score")
-            conn.close()
             return CREATE_QUESTION
-    
-    elif edit_mode == 'deadline':
-        try:
-            # Parse deadline date in format: YYYY-MM-DD HH:MM or YYYY-MM-DD
-            deadline_str = text.strip()
-            if len(deadline_str) == 10:  # Only date provided
-                deadline_str += " 23:59"
-            deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
-            if deadline_dt <= datetime.now():
-                await update.message.reply_text("❌ Deadline must be in the future. Try again (format: YYYY-MM-DD HH:MM)")
-                conn.close()
-                return CREATE_QUESTION
-            
-            c.execute('UPDATE assignments SET deadline_at=%s WHERE assignment_id=%s', (deadline_dt.isoformat(), assignment_id))
-            conn.commit()
-            await update.message.reply_text("✅ Deadline updated successfully!")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid date format. Use: YYYY-MM-DD or YYYY-MM-DD HH:MM")
-            conn.close()
-            return CREATE_QUESTION
-    
-    conn.close()
     
     # Clear edit mode and return to menu
     context.user_data['edit_mode'] = None
@@ -1467,19 +1322,15 @@ async def view_results_analytics(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ Session expired. Please login again.")
         return TEACHER_MENU
     
-    conn = get_db_connection()
-    if not conn:
-        await query.edit_message_text("❌ Database connection error.")
-        return TEACHER_MENU
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
     
     # Get all assignments and their submissions
     c.execute('''SELECT a.code, a.title, COUNT(s.submission_id) as student_count, AVG(s.score) as avg_score
                 FROM assignments a
                 LEFT JOIN submissions s ON a.assignment_id = s.assignment_id
-                WHERE a.teacher_id=%s
-                GROUP BY a.assignment_id, a.code, a.title
+                WHERE a.teacher_id=?
+                GROUP BY a.assignment_id
                 ORDER BY a.created_at DESC''', (teacher_id,))
     results = c.fetchall()
     
@@ -1574,14 +1425,10 @@ async def handle_assignment_code(update: Update, context: ContextTypes.DEFAULT_T
     code = update.message.text.strip().upper()
     
     # Find assignment
-    conn = get_db_connection()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error. Please try again.")
-        return FIND_ASSIGNMENT
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
     c.execute('''SELECT assignment_id, title, question, question_type, max_score, grading_scale, answers, deadline_at, is_active, required_fields
-                 FROM assignments WHERE code=%s''', (code,))
+                 FROM assignments WHERE code=?''', (code,))
     result = c.fetchone()
     conn.close()
     
@@ -1745,42 +1592,30 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     
     # Save submission
     submission_id = str(uuid.uuid4())
-    conn = get_db_connection()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error. Please try again.")
-        return ANSWER_SUBMISSION
-    
+    conn = sqlite3.connect("exam_data.db")
     c = conn.cursor()
-    try:
-        # FIX: Properly format student_details as JSON
-        student_details_json = json.dumps(student_details) if student_details else json.dumps({})
-        
-        c.execute('''INSERT INTO submissions
-                    (submission_id, assignment_id, student_name, student_id, answer, score, max_score, submitted_at, student_details)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                  (submission_id, assignment_id, student_name, student_id, answer, score, max_score, datetime.now(), student_details_json))
-        conn.commit()
-        conn.close()
-        
-        score_colored = format_score_with_color(score, max_score)
-        
-        keyboard = [[InlineKeyboardButton("🔍 Find Another", callback_data="find_assignment")],
-                    [InlineKeyboardButton("🏠 Back to Menu", callback_data="student_menu")]]
-        
-        await update.message.reply_text(
-            f"✅ **ANSWER SUBMITTED!**\n\n"
-            f"📊 **Your Score:** {score_colored}\n"
-            f"💡 **Feedback:** {detail}\n\n"
-            f"What's next?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        
-        return STUDENT_MAIN
-    except Exception as e:
-        conn.close()
-        await update.message.reply_text(f"❌ Error submitting answer: {str(e)}")
-        return ANSWER_SUBMISSION
+    c.execute('''INSERT INTO submissions
+                (submission_id, assignment_id, student_name, student_id, answer, score, max_score, submitted_at, student_details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (submission_id, assignment_id, student_name, student_id, answer, score, max_score, datetime.now(), json.dumps(student_details)))
+    conn.commit()
+    conn.close()
+    
+    score_colored = format_score_with_color(score, max_score)
+    
+    keyboard = [[InlineKeyboardButton("🔍 Find Another", callback_data="find_assignment")],
+                [InlineKeyboardButton("🏠 Back to Menu", callback_data="student_menu")]]
+    
+    await update.message.reply_text(
+        f"✅ **ANSWER SUBMITTED!**\n\n"
+        f"📊 **Your Score:** {score_colored}\n"
+        f"💡 **Feedback:** {detail}\n\n"
+        f"What's next?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    return STUDENT_MAIN
 
 # ============================================================================
 # QUICK GRADE (FOR ANYONE)
@@ -1865,16 +1700,15 @@ async def handle_quick_grade(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # Save to quick grades
             teacher_id = context.user_data.get('teacher_id')
             if teacher_id:
-                conn = get_db_connection()
-                if conn:
-                    c = conn.cursor()
-                    c.execute('''INSERT INTO quick_grades
-                                (grade_id, teacher_id, question, answer_given, score, max_score, graded_at)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-                              (str(uuid.uuid4()), teacher_id, context.user_data['qg_question'],
-                               context.user_data['qg_student_answer'], score, max_score, datetime.now()))
-                    conn.commit()
-                    conn.close()
+                conn = sqlite3.connect("exam_data.db")
+                c = conn.cursor()
+                c.execute('''INSERT INTO quick_grades
+                            (grade_id, teacher_id, question, answer_given, score, max_score, graded_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                          (str(uuid.uuid4()), teacher_id, context.user_data['qg_question'],
+                           context.user_data['qg_student_answer'], score, max_score, datetime.now()))
+                conn.commit()
+                conn.close()
             
             context.user_data['quick_grade_step'] = None
             return QUICK_GRADE_MENU
@@ -1884,7 +1718,7 @@ async def handle_quick_grade(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return QUICK_GRADE_MENU
 
 # ============================================================================
-# NAVIGATION HANDLERS - FIXED
+# NAVIGATION HANDLERS
 # ============================================================================
 
 async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1942,11 +1776,11 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return START
 
 # ============================================================================
-# HELP COMMAND HANDLER - FIXED NAVIGATION
+# HELP COMMAND HANDLER
 # ============================================================================
 
 async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help from callback button - FIXED VERSION"""
+    """Show help from callback button"""
     query = update.callback_query
     await query.answer()
     
@@ -1970,8 +1804,6 @@ async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard) if i == len(chunks) - 1 else None
             )
-    
-    return START
 
 def get_comprehensive_help_text():
     """Get comprehensive help text with detailed bot information"""
@@ -2083,7 +1915,7 @@ This is an intelligent examination and assignment management system designed for
 
 🔧 **TECHNICAL DETAILS**
 
-**Database:** PostgreSQL (Render Cloud)
+**Database:** SQLite3 (exam_data.db)
 **Tables:** teachers, assignments, submissions, quick_grades
 **AI Engine:** Google Gemini 2.0 Flash API
 **Language Model:** Sentence Transformers (Fallback)
@@ -2199,57 +2031,32 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error: {context.error}")
 
 # ============================================================================
-# SIGNAL HANDLERS - GRACEFUL SHUTDOWN
-# ============================================================================
-
-def on_sigterm(signum, frame):
-    """Handle SIGTERM signal"""
-    logger.info("📍 SIGTERM received, initiating shutdown...")
-    sys.exit(0)
-
-def on_sigint(signum, frame):
-    """Handle SIGINT signal"""
-    logger.info("📍 SIGINT received, initiating shutdown...")
-    sys.exit(0)
-
-# ============================================================================
 # MAIN - BOT SETUP - FIXED CONVERSATION HANDLER
 # ============================================================================
 
 def main():
     """Initialize and run bot"""
-    import signal
+    db = init_db()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGTERM, on_sigterm)
-    signal.signal(signal.SIGINT, on_sigint)
-    
-    if not init_db():
-        logger.error("❌ Failed to initialize database. Exiting.")
-        return
-    
-    try:
-        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        
-        # Main conversation handler - EXPANDED
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("start", start)],
-            states={
-                START: [
-                    CallbackQueryHandler(teacher_mode_selector, pattern="^teacher_mode$"),
-                    CallbackQueryHandler(direct_teacher_login, pattern="^teacher_login$"),
-                    CallbackQueryHandler(student_mode, pattern="^student_mode$"),
-                    CallbackQueryHandler(show_help_callback, pattern="^show_help$"),
-                    CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
-                ],
-                TEACHER_LOGIN: [
-                    CallbackQueryHandler(proceed_teacher_login, pattern="^proceed_login$"),
-                    CallbackQueryHandler(proceed_teacher_register, pattern="^proceed_register$"),
-                    CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
+    # Main conversation handler - EXPANDED
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            START: [
+                CallbackQueryHandler(teacher_mode_selector, pattern="^teacher_mode$"),
+                CallbackQueryHandler(direct_teacher_login, pattern="^teacher_login$"),
+                CallbackQueryHandler(student_mode, pattern="^student_mode$"),
+                CallbackQueryHandler(show_help_callback, pattern="^show_help$"),
+                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
+            ],
+            TEACHER_LOGIN: [
+                CallbackQueryHandler(proceed_teacher_login, pattern="^proceed_login$"),
+                CallbackQueryHandler(proceed_teacher_register, pattern="^proceed_register$"),
+                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_teacher_auth),
             ],
             TEACHER_REGISTER: [
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_teacher_auth),
             ],
             TEACHER_MENU: [
@@ -2264,7 +2071,6 @@ def main():
                 CallbackQueryHandler(handle_delete_assign, pattern="^delete_assign_"),
                 CallbackQueryHandler(handle_deactivate_assign, pattern="^deactivate_assign_"),
                 CallbackQueryHandler(handle_deactivate_assign, pattern="^activate_assign_"),
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
             ],
             CREATE_QUESTION: [
                 CallbackQueryHandler(handle_assignment_type, pattern="^type_"),
@@ -2279,7 +2085,6 @@ def main():
                 CallbackQueryHandler(handle_edit_score, pattern="^edit_score_"),
                 CallbackQueryHandler(handle_edit_deadline, pattern="^edit_deadline_"),
                 CallbackQueryHandler(back_to_teacher_menu, pattern="^teacher_menu$"),
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_assignment_creation),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
             ],
@@ -2292,15 +2097,12 @@ def main():
             FIND_ASSIGNMENT: [
                 CallbackQueryHandler(submit_answer_handler, pattern="^submit_answer$"),
                 CallbackQueryHandler(back_to_student_menu, pattern="^student_menu$"),
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_assignment_code),
             ],
             STUDENT_FILL_DETAILS: [
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_student_fill_details),
             ],
             ANSWER_SUBMISSION: [
-                CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_student_answer),
             ],
             QUICK_GRADE_MENU: [
@@ -2308,30 +2110,21 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quick_grade),
             ],
         },
-        fallbacks=[CommandHandler("start", start), CommandHandler("help", help_command)],
+        fallbacks=[CommandHandler("start", start)],
     )
     
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(conv_handler)
-        app.add_error_handler(error_handler)
-        
-        logger.info("🚀 Advanced Exam Grading Bot v2 is ONLINE!")
-        logger.info("✅ Features: Teacher Accounts | Dynamic Questions | Student Answers")
-        logger.info("✅ Features: Quick Grading | Customizable Scales | Proper Navigation")
-        logger.info("✅ FIXED: PostgreSQL Database | Teacher login now working properly!")
-        logger.info("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
-        logger.info("✅ FIXED: Navigation back buttons now working correctly!")
-        logger.info("✅ FIXED: JSON database issues resolved!")
-        logger.info("✅ FIXED: Help button now working!")
-        logger.info("\n📍 Waiting for users...\n")
-        
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(conv_handler)
+    app.add_error_handler(error_handler)
     
-    except Exception as e:
-        logger.error(f"❌ Unexpected error during bot startup: {e}", exc_info=True)
-        raise
-    except KeyboardInterrupt:
-        logger.info("Bot interrupted by user")
+    print("🚀 Advanced Exam Grading Bot v2 is ONLINE!")
+    print("✅ Features: Teacher Accounts | Dynamic Questions | Student Answers")
+    print("✅ Features: Quick Grading | Customizable Scales | Proper Navigation")
+    print("✅ FIXED: Teacher login now working properly!")
+    print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
+    print("\n📍 Waiting for users...\n")
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
