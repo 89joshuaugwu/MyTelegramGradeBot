@@ -1098,6 +1098,63 @@ async def handle_delete_assign(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return TEACHER_MENU
 
+async def handle_edit_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle edit assignment button click"""
+    query = update.callback_query
+    await query.answer()
+    
+    assignment_id = context.user_data.get('edit_assign_id')
+    
+    conn = sqlite3.connect("exam_data.db")
+    c = conn.cursor()
+    c.execute('''SELECT title, question, answers, max_score, deadline_at, required_fields, is_active
+                 FROM assignments WHERE assignment_id=?''', (assignment_id,))
+    assign = c.fetchone()
+    conn.close()
+    
+    if not assign:
+        await query.edit_message_text("❌ Assignment not found.")
+        return TEACHER_MENU
+    
+    title, question, answers, max_score, deadline_at, required_fields_json, is_active = assign
+    
+    # Parse required fields
+    required_fields = []
+    try:
+        if required_fields_json:
+            required_fields = json.loads(required_fields_json)
+    except:
+        pass
+    
+    deadline_str = get_deadline_string(deadline_at) if deadline_at else "No deadline"
+    required_str = ", ".join(required_fields) if required_fields else "None"
+    
+    keyboard = [
+        [InlineKeyboardButton("✏️ Edit Title", callback_data=f"edit_title_{assignment_id[:8]}")],
+        [InlineKeyboardButton("✏️ Edit Question", callback_data=f"edit_question_{assignment_id[:8]}")],
+        [InlineKeyboardButton("✏️ Edit Answer", callback_data=f"edit_answer_{assignment_id[:8]}")],
+        [InlineKeyboardButton("✏️ Edit Max Score", callback_data=f"edit_score_{assignment_id[:8]}")],
+        [InlineKeyboardButton("✏️ Edit Deadline", callback_data=f"edit_deadline_{assignment_id[:8]}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="my_assignments")]
+    ]
+    
+    text = f"✏️ **EDIT ASSIGNMENT**\n\n"
+    text += f"📌 **Title:** {title}\n"
+    text += f"❓ **Question:** {question}\n"
+    text += f"📝 **Correct Answer:** {answers}\n"
+    text += f"📊 **Max Score:** {max_score}\n"
+    text += f"📅 **Deadline:** {deadline_str}\n"
+    text += f"📋 **Required Fields:** {required_str}\n\n"
+    text += f"Select what you want to edit:"
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    return TEACHER_MENU
+
 async def view_results_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View results and analytics for all student submissions"""
     query = update.callback_query
@@ -1715,6 +1772,7 @@ def main():
                 CallbackQueryHandler(logout, pattern="^logout$"),
                 CallbackQueryHandler(back_to_teacher_menu, pattern="^teacher_menu$"),
                 CallbackQueryHandler(handle_view_assign_details, pattern="^view_assign_"),
+                CallbackQueryHandler(handle_edit_assign, pattern="^edit_assign_"),
                 CallbackQueryHandler(handle_delete_assign, pattern="^delete_assign_"),
                 CallbackQueryHandler(handle_deactivate_assign, pattern="^deactivate_assign_"),
                 CallbackQueryHandler(handle_deactivate_assign, pattern="^activate_assign_"),
