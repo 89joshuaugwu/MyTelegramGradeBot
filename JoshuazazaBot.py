@@ -1,5 +1,5 @@
 # ============================================================================
-# JOSHUAZAZA GRADING BOT v2 - WITH TEACHER ACCOUNTS
+# ADVANCED TELEGRAM EXAM GRADING BOT v2 - WITH TEACHER ACCOUNTS
 # FIXED VERSION - POSTGRESQL MIGRATION + NAVIGATION FIXES
 # ============================================================================
 
@@ -14,8 +14,17 @@ from datetime import datetime, timedelta
 from PIL import Image
 import pytesseract
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Use psycopg3 instead of psycopg2
+try:
+    import psycopg
+    PSYCOPG_AVAILABLE = True
+except ImportError:
+    # Fallback to psycopg2 if psycopg3 not available
+    try:
+        import psycopg2
+        PSYCOPG_AVAILABLE = True
+    except ImportError:
+        PSYCOPG_AVAILABLE = False
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -87,10 +96,14 @@ SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # PostgreSQL Database URL from Render
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://exam_data_user:0n004poxyvoQdzv2cuxqK5m1DF67PCPB@dpg-d4lcpu24d50c73e0jegg-a.frankfurt-postgres.render.com/exam_data")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not TELEGRAM_TOKEN:
     print("❌ ERROR: TELEGRAM_TOKEN missing in .env file!")
+    sys.exit(1)
+
+if not DATABASE_URL:
+    print("❌ ERROR: DATABASE_URL missing in environment variables!")
     sys.exit(1)
 
 # Initialize Gemini if API key available
@@ -122,7 +135,12 @@ if os.name == "nt":
 def get_db_connection():
     """Get PostgreSQL database connection"""
     try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        # Use psycopg3 if available, otherwise fallback to psycopg2
+        if 'psycopg' in sys.modules:
+            conn = psycopg.connect(DATABASE_URL)
+        else:
+            import psycopg2
+            conn = psycopg2.connect(DATABASE_URL)
         return conn
     except Exception as e:
         print(f"❌ Database connection error: {e}")
@@ -198,7 +216,8 @@ def register_teacher(telegram_id, username, password, full_name, grading_scale=1
         teacher_id = c.fetchone()[0]
         conn.commit()
         return True, teacher_id
-    except psycopg2.IntegrityError:
+    except Exception as e:
+        print(f"Registration error: {e}")
         return False, None
     finally:
         conn.close()
@@ -1886,7 +1905,7 @@ async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def get_comprehensive_help_text():
     """Get comprehensive help text with detailed bot information"""
     return """
-🤖 **JOSHUAZAZA GRADE BOT**
+🤖 **ADVANCED TELEGRAM EXAM GRADING BOT v2.1**
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2071,7 +2090,7 @@ This is an intelligent examination and assignment management system designed for
 
 ═══════════════════════════════════════════════════════════════
 
-✅ **BOT STATUS: FULLY OPERATIONAL**
+✅ **BOT STATUS: v2.1 - FULLY OPERATIONAL**
 
 All features working:
 ✅ Teacher accounts & authentication
@@ -2087,7 +2106,7 @@ All features working:
 
 ═══════════════════════════════════════════════════════════════
 
-Thank you for using the Joshuazaza Grading Bot! 🎓
+Thank you for using the Advanced Telegram Exam Grading Bot! 🎓
 """
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2210,6 +2229,7 @@ def main():
     print("✅ FIXED: PostgreSQL Database | Teacher login now working properly!")
     print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
     print("✅ FIXED: Navigation back buttons now working correctly!")
+    print("✅ FIXED: psycopg3 compatibility with Python 3.13!")
     print("\n📍 Waiting for users...\n")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
