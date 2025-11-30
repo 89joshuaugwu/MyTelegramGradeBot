@@ -1,6 +1,6 @@
 # ============================================================================
-# ADVANCED TELEGRAM EXAM GRADING BOT v2 - WITH TEACHER ACCOUNTS
-# FIXED VERSION - TEACHER LOGIN ISSUE RESOLVED
+# ADVANCED TELEGRAM EXAM GRADING BOT v2 - POSTGRESQL VERSION
+# MIGRATED FROM SQLITE TO POSTGRESQL
 # ============================================================================
 
 import os
@@ -8,12 +8,14 @@ import re
 import sys
 import json
 import hashlib
-import sqlite3
 import uuid
 from io import BytesIO
 from datetime import datetime, timedelta
 from PIL import Image
 import pytesseract
+
+import psycopg
+from psycopg.rows import dict_row
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,9 +23,6 @@ from telegram.ext import (
     ContextTypes, ConversationHandler, CallbackQueryHandler, CallbackContext
 )
 from dotenv import load_dotenv
-
-# Fix deprecation warning for Python 3.12+ SQLite datetime
-sqlite3.register_adapter(datetime, lambda val: val.isoformat() if val else None)
 
 # NLP & AI
 try:
@@ -86,6 +85,7 @@ threading.Thread(target=_start_health_server, daemon=True).start()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://exam_data_user:0n004poxyvoQdzv2cuxqK5m1DF67PCPB@dpg-d4lcpu24d50c73e0jegg-a.frankfurt-postgres.render.com/exam_data?sslmode=require")
 
 if not TELEGRAM_TOKEN:
     print("❌ ERROR: TELEGRAM_TOKEN missing in .env file!")
@@ -114,66 +114,51 @@ if os.name == "nt":
  EDIT_ASSIGNMENT, VIEW_SUBMISSION_DETAILS, STUDENT_FILL_DETAILS) = range(18)
 
 # ============================================================================
-# DATABASE SETUP - ENHANCED WITH TEACHER ACCOUNTS
+# DATABASE SETUP - POSTGRESQL
 # ============================================================================
 
+def get_db_connection():
+    """Get PostgreSQL database connection"""
+    return psycopg.connect(DATABASE_URL)
+
 def init_db():
-    """Initialize SQLite database with teacher accounts"""
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
+    """Initialize PostgreSQL database with teacher accounts"""
+    conn = get_db_connection()
+    cur = conn.cursor()
     
     # Teachers table
-    c.execute('''CREATE TABLE IF NOT EXISTS teachers
-        (teacher_id INTEGER PRIMARY KEY, telegram_id INT UNIQUE, username TEXT UNIQUE,
+    cur.execute('''CREATE TABLE IF NOT EXISTS teachers
+        (teacher_id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE, username TEXT UNIQUE,
          password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
     
     # Questions/Assignments table - EXPANDED
-    c.execute('''CREATE TABLE IF NOT EXISTS assignments
+    cur.execute('''CREATE TABLE IF NOT EXISTS assignments
         (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
          title TEXT, question TEXT, question_type TEXT, 
          max_score INT, grading_scale INT, created_at TIMESTAMP, 
-         answers JSON, rubric JSON, deadline_at TIMESTAMP, 
-         required_fields JSON, is_active INT DEFAULT 1,
+         answers JSONB, rubric JSONB, deadline_at TIMESTAMP, 
+         required_fields JSONB, is_active BOOLEAN DEFAULT TRUE,
          FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
     
     # Student submissions - EXPANDED
-    c.execute('''CREATE TABLE IF NOT EXISTS submissions
+    cur.execute('''CREATE TABLE IF NOT EXISTS submissions
         (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
-         student_id INT, answer TEXT, score REAL, max_score INT,
-         grading_details JSON, submitted_at TIMESTAMP, student_details JSON,
+         student_id BIGINT, answer TEXT, score REAL, max_score INT,
+         grading_details JSONB, submitted_at TIMESTAMP, student_details JSONB,
          FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
     
     # Quick grading cache
-    c.execute('''CREATE TABLE IF NOT EXISTS quick_grades
+    cur.execute('''CREATE TABLE IF NOT EXISTS quick_grades
         (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
          answer_given TEXT, score REAL, max_score INT,
          graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
     
     conn.commit()
+    cur.close()
+    conn.close()
     
-    # ADD MISSING COLUMNS TO EXISTING TABLES (for migration from old schema)
-    try:
-        c.execute("ALTER TABLE assignments ADD COLUMN deadline_at TIMESTAMP")
-    except:
-        pass
-    
-    try:
-        c.execute("ALTER TABLE assignments ADD COLUMN required_fields JSON")
-    except:
-        pass
-    
-    try:
-        c.execute("ALTER TABLE assignments ADD COLUMN is_active INT DEFAULT 1")
-    except:
-        pass
-    
-    try:
-        c.execute("ALTER TABLE submissions ADD COLUMN student_details JSON")
-    except:
-        pass
-    
-    conn.commit()
-    return conn
+    print("✅ PostgreSQL database initialized successfully!")
+    return True
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -189,41 +174,44 @@ def generate_assignment_code():
 
 def register_teacher(telegram_id, username, password, full_name, grading_scale=100):
     """Register new teacher"""
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
     
     try:
         hashed_pass = hash_password(password)
-        c.execute('''INSERT INTO teachers (telegram_id, username, password, full_name, grading_scale, created_at)
-                     VALUES (?, ?, ?, ?, ?, ?)''',
+        cur.execute('''INSERT INTO teachers (telegram_id, username, password, full_name, grading_scale, created_at)
+                     VALUES (%s, %s, %s, %s, %s, %s) RETURNING teacher_id''',
                   (telegram_id, username, hashed_pass, full_name, grading_scale, datetime.now()))
+        teacher_id = cur.fetchone()[0]
         conn.commit()
-        teacher_id = c.lastrowid
         return True, teacher_id
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         return False, None
     finally:
+        cur.close()
         conn.close()
 
 def login_teacher(username, password):
     """Login teacher and return teacher_id"""
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
     
     hashed_pass = hash_password(password)
-    c.execute("SELECT teacher_id, full_name FROM teachers WHERE username=? AND password=?",
+    cur.execute("SELECT teacher_id, full_name FROM teachers WHERE username=%s AND password=%s",
               (username, hashed_pass))
-    result = c.fetchone()
+    result = cur.fetchone()
+    cur.close()
     conn.close()
     
     return result if result else (None, None)
 
 def teacher_exists_by_telegram(telegram_id):
     """Check if teacher account exists"""
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
-    c.execute("SELECT teacher_id, full_name FROM teachers WHERE telegram_id=?", (telegram_id,))
-    result = c.fetchone()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT teacher_id, full_name FROM teachers WHERE telegram_id=%s", (telegram_id,))
+    result = cur.fetchone()
+    cur.close()
     conn.close()
     return result
 
@@ -251,14 +239,14 @@ def is_assignment_expired(deadline_at):
     """Check if assignment deadline has passed"""
     if not deadline_at:
         return False
-    deadline = datetime.fromisoformat(deadline_at) if isinstance(deadline_at, str) else deadline_at
+    deadline = deadline_at if isinstance(deadline_at, datetime) else datetime.fromisoformat(deadline_at)
     return datetime.now() > deadline
 
 def get_deadline_string(deadline_at):
     """Format deadline for display"""
     if not deadline_at:
         return "No deadline"
-    deadline = datetime.fromisoformat(deadline_at) if isinstance(deadline_at, str) else deadline_at
+    deadline = deadline_at if isinstance(deadline_at, datetime) else datetime.fromisoformat(deadline_at)
     return deadline.strftime("%B %d, %Y at %I:%M %p")
 
 def ocr_from_image_bytes(image_bytes):
@@ -685,10 +673,10 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
     max_score = context.user_data.get('assign_max_score')
     
     # Get teacher's grading scale
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
-    c.execute("SELECT grading_scale FROM teachers WHERE teacher_id=?", (teacher_id,))
-    scale = c.fetchone()[0]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT grading_scale FROM teachers WHERE teacher_id=%s", (teacher_id,))
+    scale = cur.fetchone()[0]
     
     # Create assignment
     assignment_id = str(uuid.uuid4())
@@ -696,16 +684,17 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
     required_fields = json.dumps(context.user_data.get('required_fields', []))
     deadline_at = context.user_data.get('assign_deadline')
     
-    c.execute('''INSERT INTO assignments 
+    cur.execute('''INSERT INTO assignments 
                 (assignment_id, teacher_id, code, title, question, 
                  question_type, max_score, grading_scale, created_at, answers, 
                  required_fields, deadline_at, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
               (assignment_id, teacher_id, code, context.user_data['assign_title'],
                context.user_data['assign_question'], context.user_data['assign_type'],
                max_score, scale, datetime.now(), context.user_data['assign_answer'],
-               required_fields, deadline_at, 1))
+               required_fields, deadline_at, True))
     conn.commit()
+    cur.close()
     conn.close()
     
     deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
@@ -742,15 +731,15 @@ async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAU
     
     teacher_id = context.user_data.get('teacher_id')
     
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
     # Get assignment details
-    c.execute('''SELECT assignment_id, code, title, question, question_type, max_score, 
+    cur.execute('''SELECT assignment_id, code, title, question, question_type, max_score, 
                         deadline_at, required_fields, created_at, is_active
                  FROM assignments 
-                 WHERE teacher_id=? AND assignment_id LIKE ?''', 
+                 WHERE teacher_id=%s AND assignment_id LIKE %s''', 
               (teacher_id, f"{assign_id_prefix}%"))
-    assign = c.fetchone()
+    assign = cur.fetchone()
     
     if not assign:
         await query.edit_message_text("❌ Assignment not found.")
@@ -759,11 +748,12 @@ async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAU
     assignment_id, code, title, question, qtype, max_score, deadline_at, required_fields_json, created_at, is_active = assign
     
     # Get all submissions
-    c.execute('''SELECT submission_id, student_name, student_id, answer, score, max_score, submitted_at, student_details
+    cur.execute('''SELECT submission_id, student_name, student_id, answer, score, max_score, submitted_at, student_details
                  FROM submissions 
-                 WHERE assignment_id=?
+                 WHERE assignment_id=%s
                  ORDER BY submitted_at DESC''', (assignment_id,))
-    submissions = c.fetchall()
+    submissions = cur.fetchall()
+    cur.close()
     conn.close()
     
     context.user_data['edit_assign_id'] = assignment_id
@@ -1038,17 +1028,18 @@ async def view_my_assignments(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("❌ Session expired. Please login again.")
         return TEACHER_MENU
     
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
     # Get assignments with submission counts
-    c.execute('''SELECT a.assignment_id, a.code, a.title, a.question_type, a.max_score, a.created_at,
+    cur.execute('''SELECT a.assignment_id, a.code, a.title, a.question_type, a.max_score, a.created_at,
                         a.deadline_at, COUNT(s.submission_id) as submission_count
                  FROM assignments a
                  LEFT JOIN submissions s ON a.assignment_id = s.assignment_id
-                 WHERE a.teacher_id=?
+                 WHERE a.teacher_id=%s
                  GROUP BY a.assignment_id
                  ORDER BY a.created_at DESC''', (teacher_id,))
-    assignments = c.fetchall()
+    assignments = cur.fetchall()
+    cur.close()
     conn.close()
     
     if not assignments:
@@ -1089,12 +1080,13 @@ async def handle_deactivate_assign(update: Update, context: ContextTypes.DEFAULT
     
     assignment_id = context.user_data.get('edit_assign_id')
     action = query.data.replace("activate_assign", "").replace("deactivate_assign", "")
-    is_active = 0 if "deactivate" in query.data else 1
+    is_active = False if "deactivate" in query.data else True
     
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
-    c.execute('UPDATE assignments SET is_active=? WHERE assignment_id=?', (is_active, assignment_id))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (is_active, assignment_id))
     conn.commit()
+    cur.close()
     conn.close()
     
     status = "✅ ACTIVATED" if is_active else "❌ DEACTIVATED"
@@ -1109,13 +1101,14 @@ async def handle_delete_assign(update: Update, context: ContextTypes.DEFAULT_TYP
     
     assignment_id = context.user_data.get('edit_assign_id')
     
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
     # Delete related submissions first
-    c.execute('DELETE FROM submissions WHERE assignment_id=?', (assignment_id,))
+    cur.execute('DELETE FROM submissions WHERE assignment_id=%s', (assignment_id,))
     # Then delete assignment
-    c.execute('DELETE FROM assignments WHERE assignment_id=?', (assignment_id,))
+    cur.execute('DELETE FROM assignments WHERE assignment_id=%s', (assignment_id,))
     conn.commit()
+    cur.close()
     conn.close()
     
     keyboard = [[InlineKeyboardButton("Back to Assignments", callback_data="my_assignments")]]
@@ -1133,11 +1126,12 @@ async def handle_edit_assign(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     assignment_id = context.user_data.get('edit_assign_id')
     
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
-    c.execute('''SELECT title, question, answers, max_score, deadline_at, required_fields, is_active
-                 FROM assignments WHERE assignment_id=?''', (assignment_id,))
-    assign = c.fetchone()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''SELECT title, question, answers, max_score, deadline_at, required_fields, is_active
+                 FROM assignments WHERE assignment_id=%s''', (assignment_id,))
+    assign = cur.fetchone()
+    cur.close()
     conn.close()
     
     if not assign:
@@ -1268,28 +1262,31 @@ async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_T
     
     if edit_mode == 'title':
         # Update title
-        conn = sqlite3.connect("exam_data.db")
-        c = conn.cursor()
-        c.execute('UPDATE assignments SET title=? WHERE assignment_id=?', (text, assignment_id))
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('UPDATE assignments SET title=%s WHERE assignment_id=%s', (text, assignment_id))
         conn.commit()
+        cur.close()
         conn.close()
         await update.message.reply_text("✅ Title updated successfully!")
         
     elif edit_mode == 'question':
         # Update question
-        conn = sqlite3.connect("exam_data.db")
-        c = conn.cursor()
-        c.execute('UPDATE assignments SET question=? WHERE assignment_id=?', (text, assignment_id))
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('UPDATE assignments SET question=%s WHERE assignment_id=%s', (text, assignment_id))
         conn.commit()
+        cur.close()
         conn.close()
         await update.message.reply_text("✅ Question updated successfully!")
         
     elif edit_mode == 'answer':
         # Update answer
-        conn = sqlite3.connect("exam_data.db")
-        c = conn.cursor()
-        c.execute('UPDATE assignments SET answers=? WHERE assignment_id=?', (text, assignment_id))
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('UPDATE assignments SET answers=%s WHERE assignment_id=%s', (text, assignment_id))
         conn.commit()
+        cur.close()
         conn.close()
         await update.message.reply_text("✅ Correct answer updated successfully!")
         
@@ -1297,10 +1294,11 @@ async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_T
         # Update max score
         try:
             score = int(text)
-            conn = sqlite3.connect("exam_data.db")
-            c = conn.cursor()
-            c.execute('UPDATE assignments SET max_score=? WHERE assignment_id=?', (score, assignment_id))
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute('UPDATE assignments SET max_score=%s WHERE assignment_id=%s', (score, assignment_id))
             conn.commit()
+            cur.close()
             conn.close()
             await update.message.reply_text(f"✅ Max score updated to {score}!")
         except ValueError:
@@ -1322,18 +1320,19 @@ async def view_results_analytics(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ Session expired. Please login again.")
         return TEACHER_MENU
     
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
     
     # Get all assignments and their submissions
-    c.execute('''SELECT a.code, a.title, COUNT(s.submission_id) as student_count, AVG(s.score) as avg_score
+    cur.execute('''SELECT a.code, a.title, COUNT(s.submission_id) as student_count, AVG(s.score) as avg_score
                 FROM assignments a
                 LEFT JOIN submissions s ON a.assignment_id = s.assignment_id
-                WHERE a.teacher_id=?
+                WHERE a.teacher_id=%s
                 GROUP BY a.assignment_id
                 ORDER BY a.created_at DESC''', (teacher_id,))
-    results = c.fetchall()
+    results = cur.fetchall()
     
+    cur.close()
     conn.close()
     
     if not results:
@@ -1425,11 +1424,12 @@ async def handle_assignment_code(update: Update, context: ContextTypes.DEFAULT_T
     code = update.message.text.strip().upper()
     
     # Find assignment
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
-    c.execute('''SELECT assignment_id, title, question, question_type, max_score, grading_scale, answers, deadline_at, is_active, required_fields
-                 FROM assignments WHERE code=?''', (code,))
-    result = c.fetchone()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''SELECT assignment_id, title, question, question_type, max_score, grading_scale, answers, deadline_at, is_active, required_fields
+                 FROM assignments WHERE code=%s''', (code,))
+    result = cur.fetchone()
+    cur.close()
     conn.close()
     
     if not result:
@@ -1592,13 +1592,14 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     
     # Save submission
     submission_id = str(uuid.uuid4())
-    conn = sqlite3.connect("exam_data.db")
-    c = conn.cursor()
-    c.execute('''INSERT INTO submissions
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''INSERT INTO submissions
                 (submission_id, assignment_id, student_name, student_id, answer, score, max_score, submitted_at, student_details)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
               (submission_id, assignment_id, student_name, student_id, answer, score, max_score, datetime.now(), json.dumps(student_details)))
     conn.commit()
+    cur.close()
     conn.close()
     
     score_colored = format_score_with_color(score, max_score)
@@ -1700,14 +1701,15 @@ async def handle_quick_grade(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # Save to quick grades
             teacher_id = context.user_data.get('teacher_id')
             if teacher_id:
-                conn = sqlite3.connect("exam_data.db")
-                c = conn.cursor()
-                c.execute('''INSERT INTO quick_grades
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute('''INSERT INTO quick_grades
                             (grade_id, teacher_id, question, answer_given, score, max_score, graded_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)''',
                           (str(uuid.uuid4()), teacher_id, context.user_data['qg_question'],
                            context.user_data['qg_student_answer'], score, max_score, datetime.now()))
                 conn.commit()
+                cur.close()
                 conn.close()
             
             context.user_data['quick_grade_step'] = None
@@ -1808,7 +1810,7 @@ async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def get_comprehensive_help_text():
     """Get comprehensive help text with detailed bot information"""
     return """
-🤖 **ADVANCED TELEGRAM EXAM GRADING BOT v2.1**
+🤖 **ADVANCED TELEGRAM EXAM GRADING BOT v2.1 - POSTGRESQL EDITION**
 
 ═══════════════════════════════════════════════════════════════
 
@@ -1826,6 +1828,7 @@ This is an intelligent examination and assignment management system designed for
 • 📊 Real-time analytics and results
 • ✏️ Edit assignments after creation
 • 🗑️ Delete assignments and manage submissions
+• 🗄️ **NEW: PostgreSQL Database** for better performance and reliability
 
 ═══════════════════════════════════════════════════════════════
 
@@ -1915,7 +1918,7 @@ This is an intelligent examination and assignment management system designed for
 
 🔧 **TECHNICAL DETAILS**
 
-**Database:** SQLite3 (exam_data.db)
+**Database:** PostgreSQL (Render Cloud Database)
 **Tables:** teachers, assignments, submissions, quick_grades
 **AI Engine:** Google Gemini 2.0 Flash API
 **Language Model:** Sentence Transformers (Fallback)
@@ -1993,7 +1996,7 @@ This is an intelligent examination and assignment management system designed for
 
 ═══════════════════════════════════════════════════════════════
 
-✅ **BOT STATUS: v2.1 - FULLY OPERATIONAL**
+✅ **BOT STATUS: v2.1 - POSTGRESQL - FULLY OPERATIONAL**
 
 All features working:
 ✅ Teacher accounts & authentication
@@ -2006,6 +2009,7 @@ All features working:
 ✅ Fallback semantic grading
 ✅ Real-time results
 ✅ Quick grading mode
+✅ **NEW: PostgreSQL Database**
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2036,7 +2040,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Initialize and run bot"""
-    db = init_db()
+    # Initialize PostgreSQL database
+    init_db()
+    
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
     # Main conversation handler - EXPANDED
@@ -2117,9 +2123,11 @@ def main():
     app.add_handler(conv_handler)
     app.add_error_handler(error_handler)
     
-    print("🚀 Advanced Exam Grading Bot v2 is ONLINE!")
+    print("🚀 Advanced Exam Grading Bot v2 - PostgreSQL Edition is ONLINE!")
+    print("✅ Database: PostgreSQL (Render Cloud)")
     print("✅ Features: Teacher Accounts | Dynamic Questions | Student Answers")
     print("✅ Features: Quick Grading | Customizable Scales | Proper Navigation")
+    print("✅ NEW: PostgreSQL database for better performance and reliability!")
     print("✅ FIXED: Teacher login now working properly!")
     print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
     print("\n📍 Waiting for users...\n")
