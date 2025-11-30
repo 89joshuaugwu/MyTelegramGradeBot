@@ -1,5 +1,5 @@
 # ============================================================================
-# ADVANCED TELEGRAM EXAM GRADING BOT v2 - POSTGRESQL VERSION
+# JOSHUAZAZA GRADE BOT - v2.1
 # MIGRATED FROM SQLITE TO POSTGRESQL
 # ============================================================================
 
@@ -684,7 +684,6 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
     required_fields = json.dumps(context.user_data.get('required_fields', []))
     deadline_at = context.user_data.get('assign_deadline')
     
-    # FIXED: Changed 1 to True for is_active boolean
     cur.execute('''INSERT INTO assignments 
                 (assignment_id, teacher_id, code, title, question, 
                  question_type, max_score, grading_scale, created_at, answers, 
@@ -693,7 +692,7 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
               (assignment_id, teacher_id, code, context.user_data['assign_title'],
                context.user_data['assign_question'], context.user_data['assign_type'],
                max_score, scale, datetime.now(), context.user_data['assign_answer'],
-               required_fields, deadline_at, True))  # FIXED: Changed 1 to True
+               required_fields, deadline_at, int(True)))
     conn.commit()
     cur.close()
     conn.close()
@@ -1081,11 +1080,11 @@ async def handle_deactivate_assign(update: Update, context: ContextTypes.DEFAULT
     
     assignment_id = context.user_data.get('edit_assign_id')
     action = query.data.replace("activate_assign", "").replace("deactivate_assign", "")
-    is_active = False if "deactivate" in query.data else True  # FIXED: Using boolean
+    is_active = False if "deactivate" in query.data else True
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (is_active, assignment_id))
+    cur.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (int(is_active), assignment_id))
     conn.commit()
     cur.close()
     conn.close()
@@ -1733,7 +1732,7 @@ async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     
     await query.edit_message_text(
-        "👋 **Back to Start**\n\n"
+        "👋 Back to Start\n\n"
         "Type /start to begin again"
     )
     return START
@@ -1757,7 +1756,7 @@ async def back_to_student_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     
     await query.edit_message_text(
-        "👨‍🎓 **STUDENT PORTAL**\n\n"
+        "👨‍🎓 STUDENT PORTAL\n\n"
         "What would you like to do?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -1773,13 +1772,13 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     
     await query.edit_message_text(
-        "👋 **Logged out successfully!**\n\n"
+        "👋 Logged out successfully!\n\n"
         "Type /start to login again"
     )
     return START
 
 # ============================================================================
-# HELP COMMAND HANDLERS
+# HELP COMMAND HANDLER
 # ============================================================================
 
 async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1811,7 +1810,7 @@ async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def get_comprehensive_help_text():
     """Get comprehensive help text with detailed bot information"""
     return """
-🤖 **ADVANCED TELEGRAM EXAM GRADING BOT v2.1 - POSTGRESQL EDITION**
+🤖 **JOSHUAZAZA GRADE BOT - v2.1**
 
 ═══════════════════════════════════════════════════════════════
 
@@ -1915,20 +1914,6 @@ This is an intelligent examination and assignment management system designed for
 • No late submissions allowed
 • Contact teacher if deadline issues
 
-═══════════════════════════════════════════════════════════════
-
-🔧 **TECHNICAL DETAILS**
-
-**Database:** PostgreSQL (Render Cloud Database)
-**Tables:** teachers, assignments, submissions, quick_grades
-**AI Engine:** Google Gemini 2.0 Flash API
-**Language Model:** Sentence Transformers (Fallback)
-**Grading Methods:** Exact match, Keyword, Semantic similarity, Manual
-
-**Storage:**
-• Assignments: Title, Question, Type, Score, Deadline, Required Fields
-• Submissions: Student name, Answer, Score, Feedback, Student Details, Timestamp
-• Teachers: Username, Password, Name, Grading Scale
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2010,7 +1995,7 @@ All features working:
 ✅ Fallback semantic grading
 ✅ Real-time results
 ✅ Quick grading mode
-✅ **NEW: PostgreSQL Database**
+✅ Database for storing datas
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2131,7 +2116,6 @@ def main():
     print("✅ NEW: PostgreSQL database for better performance and reliability!")
     print("✅ FIXED: Teacher login now working properly!")
     print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
-    print("✅ FIXED: Boolean data type issues resolved!")
     print("\n📍 Waiting for users...\n")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
