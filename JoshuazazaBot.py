@@ -1,5 +1,5 @@
 # ============================================================================
-# ADVANCED TELEGRAM EXAM GRADING BOT v2 - POSTGRESQL VERSION
+# JOSHUAZAZA GRADE BOT - v2.1
 # MIGRATED FROM SQLITE TO POSTGRESQL
 # ============================================================================
 
@@ -1732,7 +1732,7 @@ async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     
     await query.edit_message_text(
-        "👋 **Back to Start**\n\n"
+        "👋 Back to Start\n\n"
         "Type /start to begin again"
     )
     return START
@@ -1756,7 +1756,7 @@ async def back_to_student_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     
     await query.edit_message_text(
-        "👨‍🎓 **STUDENT PORTAL**\n\n"
+        "👨‍🎓 STUDENT PORTAL\n\n"
         "What would you like to do?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -1772,7 +1772,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     
     await query.edit_message_text(
-        "👋 **Logged out successfully!**\n\n"
+        "👋 Logged out successfully!\n\n"
         "Type /start to login again"
     )
     return START
@@ -1810,7 +1810,7 @@ async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def get_comprehensive_help_text():
     """Get comprehensive help text with detailed bot information"""
     return """
-🤖 **ADVANCED TELEGRAM EXAM GRADING BOT v2.1 - POSTGRESQL EDITION**
+🤖 **JOSHUAZAZA GRADE BOT - v2.1**
 
 ═══════════════════════════════════════════════════════════════
 
@@ -1914,20 +1914,6 @@ This is an intelligent examination and assignment management system designed for
 • No late submissions allowed
 • Contact teacher if deadline issues
 
-═══════════════════════════════════════════════════════════════
-
-🔧 **TECHNICAL DETAILS**
-
-**Database:** PostgreSQL (Render Cloud Database)
-**Tables:** teachers, assignments, submissions, quick_grades
-**AI Engine:** Google Gemini 2.0 Flash API
-**Language Model:** Sentence Transformers (Fallback)
-**Grading Methods:** Exact match, Keyword, Semantic similarity, Manual
-
-**Storage:**
-• Assignments: Title, Question, Type, Score, Deadline, Required Fields
-• Submissions: Student name, Answer, Score, Feedback, Student Details, Timestamp
-• Teachers: Username, Password, Name, Grading Scale
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2009,7 +1995,7 @@ All features working:
 ✅ Fallback semantic grading
 ✅ Real-time results
 ✅ Quick grading mode
-✅ **NEW: PostgreSQL Database**
+✅ Database for storing datas
 
 ═══════════════════════════════════════════════════════════════
 
