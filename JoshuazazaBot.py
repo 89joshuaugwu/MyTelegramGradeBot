@@ -25,7 +25,7 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 
-# Import for Excel export
+# Import for Excel export with safety
 try:
     import pandas as pd
     PANDAS_AVAILABLE = True
@@ -1799,6 +1799,11 @@ async def handle_export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     assignment_id = query.data.replace("export_excel_", "")
     
+    # Safety check for pandas availability
+    if not PANDAS_AVAILABLE:
+        await query.edit_message_text("⚠️ Excel export temporarily unavailable (pandas not loaded).")
+        return TEACHER_MENU
+    
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -1824,108 +1829,54 @@ async def handle_export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE
         return TEACHER_MENU
     
     try:
-        if PANDAS_AVAILABLE:
-            # Prepare data for Excel using pandas
-            data = []
-            for subm in submissions:
-                student_name, student_id, answer, score, max_score, submitted_at, student_details = subm
-                
-                # Base fields
-                row = {
-                    'Student Name': student_name or "Anonymous",
-                    'Telegram ID': student_id,
-                    'Answer': answer,
-                    'Score': score or 0,
-                    'Max Score': max_score,
-                    'Percentage': f"{(score/max_score*100):.1f}%" if max_score > 0 else "0%",
-                    'Submitted At': submitted_at.strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-                # Add custom student details
-                if student_details:
-                    try:
-                        details_dict = json.loads(student_details)
-                        for key, value in details_dict.items():
-                            row[key] = value
-                    except:
-                        pass
-                
-                data.append(row)
+        # Prepare data for Excel using pandas
+        data = []
+        for subm in submissions:
+            student_name, student_id, answer, score, max_score, submitted_at, student_details = subm
             
-            # Create DataFrame
-            df = pd.DataFrame(data)
+            # Base fields
+            row = {
+                'Student Name': student_name or "Anonymous",
+                'Telegram ID': student_id,
+                'Answer': answer,
+                'Score': score or 0,
+                'Max Score': max_score,
+                'Percentage': f"{(score/max_score*100):.1f}%" if max_score > 0 else "0%",
+                'Submitted At': submitted_at.strftime("%Y-%m-%d %H:%M:%S")
+            }
             
-            # Create Excel file in memory
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name='Submissions', index=False)
-            
-            output.seek(0)
-            
-            # Send file
-            filename = f"{title.replace(' ', '_')}_submissions.xlsx"
-            await query.message.reply_document(
-                document=InputFile(output, filename=filename),
-                caption=f"📊 **Submissions Export**\n\n"
-                       f"📌 {title}\n"
-                       f"👥 {len(submissions)} students\n"
-                       f"📅 Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
-        else:
-            # Fallback to CSV if pandas is not available
-            import csv
-            
-            output = BytesIO()
-            writer = csv.writer(output)
-            
-            # Write header
-            header = ['Student Name', 'Telegram ID', 'Answer', 'Score', 'Max Score', 'Percentage', 'Submitted At']
-            
-            # Add custom fields from first submission
-            if submissions and submissions[0][6]:  # student_details exists
+            # Add custom student details
+            if student_details:
                 try:
-                    details_dict = json.loads(submissions[0][6])
-                    header.extend(details_dict.keys())
+                    details_dict = json.loads(student_details)
+                    for key, value in details_dict.items():
+                        row[key] = value
                 except:
                     pass
             
-            writer.writerow(header)
-            
-            # Write data
-            for subm in submissions:
-                student_name, student_id, answer, score, max_score, submitted_at, student_details = subm
-                
-                row = [
-                    student_name or "Anonymous",
-                    student_id,
-                    answer,
-                    score or 0,
-                    max_score,
-                    f"{(score/max_score*100):.1f}%" if max_score > 0 else "0%",
-                    submitted_at.strftime("%Y-%m-%d %H:%M:%S")
-                ]
-                
-                # Add custom details
-                if student_details:
-                    try:
-                        details_dict = json.loads(student_details)
-                        for key in header[7:]:  # Only include keys that are in header
-                            row.append(details_dict.get(key, ''))
-                    except:
-                        pass
-                
-                writer.writerow(row)
-            
-            output.seek(0)
-            filename = f"{title.replace(' ', '_')}_submissions.csv"
-            
-            await query.message.reply_document(
-                document=InputFile(output, filename=filename),
-                caption=f"📊 **Submissions Export (CSV)**\n\n"
-                       f"📌 {title}\n"
-                       f"👥 {len(submissions)} students\n"
-                       f"📅 Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
+            data.append(row)
+        
+        # Create DataFrame
+        df = pd.DataFrame(data)
+        
+        # Create Excel file in memory
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name="Results", index=False)
+        
+        output.seek(0)
+        
+        # Create safe filename
+        safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:50]
+        filename = f"{safe_title}_submissions.xlsx"
+        
+        await query.message.reply_document(
+            document=InputFile(output, filename=filename),
+            caption=f"📊 **Submissions Export**\n\n"
+                   f"📌 {title}\n"
+                   f"👥 {len(submissions)} students\n"
+                   f"📅 Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
         
         await query.delete_message()
         
@@ -2094,7 +2045,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return START
 
 # ============================================================================
-# HELP COMMAND HANDLER
+# HELP COMMAND HANDLERS
 # ============================================================================
 
 async def show_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2446,6 +2397,7 @@ def main():
     print("✅ NEW: View All Submissions | Export to Excel")
     print("✅ FIXED: Required fields collection now working perfectly!")
     print("✅ FIXED: Export to Excel now working with proper callback patterns!")
+    print("✅ FIXED: Pandas compatibility with Python 3.13!")
     print("\n📍 Waiting for users...\n")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
