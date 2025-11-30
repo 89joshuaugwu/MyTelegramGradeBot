@@ -86,7 +86,7 @@ threading.Thread(target=_start_health_server, daemon=True).start()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://exam_data_user:0n004poxyvoQdzv2cuxqK5m1DF67PCPB@dpg-d4lcpu24d50c73e0jegg-a/exam_data")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not TELEGRAM_TOKEN:
     print("❌ ERROR: TELEGRAM_TOKEN missing in .env file!")
