@@ -1,6 +1,6 @@
 # ============================================================================
 # JOSHUAZAZA GRADE BOT - v2.1
-# MIGRATED FROM SQLITE TO POSTGRESQL
+# MIGRATED FROM SQLITE TO POSTGRESQL - FIXED VERSION
 # ============================================================================
 
 import os
@@ -136,7 +136,7 @@ def init_db():
         (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
          title TEXT, question TEXT, question_type TEXT, 
          max_score INT, grading_scale INT, created_at TIMESTAMP, 
-         answers JSONB, rubric JSONB, deadline_at TIMESTAMP, 
+         answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
          required_fields JSONB, is_active BOOLEAN DEFAULT TRUE,
          FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
     
@@ -692,7 +692,7 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
               (assignment_id, teacher_id, code, context.user_data['assign_title'],
                context.user_data['assign_question'], context.user_data['assign_type'],
                max_score, scale, datetime.now(), context.user_data['assign_answer'],
-               required_fields, deadline_at, int(True)))
+               required_fields, deadline_at, True))
     conn.commit()
     cur.close()
     conn.close()
@@ -866,12 +866,14 @@ async def handle_assignment_creation(update: Update, context: ContextTypes.DEFAU
             if deadline_dt <= datetime.now():
                 await update.message.reply_text("❌ Deadline must be in the future. Try again (format: YYYY-MM-DD HH:MM)")
                 return CREATE_QUESTION
-            context.user_data['assign_deadline'] = deadline_dt.isoformat()
+            context.user_data['assign_deadline'] = deadline_dt
             await finalize_assignment(update, context, teacher_id)
             return TEACHER_MENU
         except ValueError:
             await update.message.reply_text("❌ Invalid date format. Use: YYYY-MM-DD or YYYY-MM-DD HH:MM")
             return CREATE_QUESTION
+    
+    return CREATE_QUESTION
 
 async def handle_assignment_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle assignment type selection"""
@@ -1084,7 +1086,7 @@ async def handle_deactivate_assign(update: Update, context: ContextTypes.DEFAULT
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (int(is_active), assignment_id))
+    cur.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (is_active, assignment_id))
     conn.commit()
     cur.close()
     conn.close()
@@ -1238,7 +1240,7 @@ async def handle_edit_deadline(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     
-    keyboard = [[InlineKeyboardButton("⏭️ No Deadline", callback_data="no_deadline")]]
+    keyboard = [[InlineKeyboardButton("⏭️ No Deadline", callback_data="no_deadline_edit")]]
     await query.edit_message_text(
         "✏️ **EDIT DEADLINE**\n\n"
         "Send new deadline date and time:\n"
@@ -1305,7 +1307,49 @@ async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("❌ Please enter a valid number for max score")
             return CREATE_QUESTION
     
+    elif edit_mode == 'deadline':
+        try:
+            # Parse deadline date in format: YYYY-MM-DD HH:MM or YYYY-MM-DD
+            deadline_str = text.strip()
+            if len(deadline_str) == 10:  # Only date provided
+                deadline_str += " 23:59"
+            deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
+            if deadline_dt <= datetime.now():
+                await update.message.reply_text("❌ Deadline must be in the future. Try again (format: YYYY-MM-DD HH:MM)")
+                return CREATE_QUESTION
+            
+            # Update deadline
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute('UPDATE assignments SET deadline_at=%s WHERE assignment_id=%s', (deadline_dt, assignment_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            await update.message.reply_text(f"✅ Deadline updated to {get_deadline_string(deadline_dt)}!")
+        except ValueError:
+            await update.message.reply_text("❌ Invalid date format. Use: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+            return CREATE_QUESTION
+    
     # Clear edit mode and return to menu
+    context.user_data['edit_mode'] = None
+    context.user_data['edit_assign_id'] = None
+    return TEACHER_MENU
+
+async def handle_no_deadline_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Skip deadline setup in edit mode"""
+    query = update.callback_query
+    await query.answer()
+    
+    assignment_id = context.user_data.get('edit_assign_id')
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('UPDATE assignments SET deadline_at=%s WHERE assignment_id=%s', (None, assignment_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    await query.edit_message_text("✅ Deadline removed successfully!")
     context.user_data['edit_mode'] = None
     context.user_data['edit_assign_id'] = None
     return TEACHER_MENU
@@ -2061,8 +2105,7 @@ def main():
                 CallbackQueryHandler(handle_view_assign_details, pattern="^view_assign_"),
                 CallbackQueryHandler(handle_edit_assign, pattern="^edit_assign_"),
                 CallbackQueryHandler(handle_delete_assign, pattern="^delete_assign_"),
-                CallbackQueryHandler(handle_deactivate_assign, pattern="^deactivate_assign_"),
-                CallbackQueryHandler(handle_deactivate_assign, pattern="^activate_assign_"),
+                CallbackQueryHandler(handle_deactivate_assign, pattern="^(de)?activate_assign_"),
             ],
             CREATE_QUESTION: [
                 CallbackQueryHandler(handle_assignment_type, pattern="^type_"),
@@ -2071,6 +2114,7 @@ def main():
                 CallbackQueryHandler(handle_fields_done, pattern="^fields_done$"),
                 CallbackQueryHandler(handle_proceed_deadline, pattern="^proceed_deadline$"),
                 CallbackQueryHandler(handle_no_deadline, pattern="^no_deadline$"),
+                CallbackQueryHandler(handle_no_deadline_edit, pattern="^no_deadline_edit$"),
                 CallbackQueryHandler(handle_edit_title, pattern="^edit_title_"),
                 CallbackQueryHandler(handle_edit_question, pattern="^edit_question_"),
                 CallbackQueryHandler(handle_edit_answer, pattern="^edit_answer_"),
