@@ -18,7 +18,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters, 
     ContextTypes, ConversationHandler, CallbackQueryHandler, CallbackContext
@@ -86,7 +86,7 @@ threading.Thread(target=_start_health_server, daemon=True).start()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://exam_data_user:0n004poxyvoQdzv2cuxqK5m1DF67PCPB@dpg-d4lcpu24d50c73e0jegg-a/exam_data")
 
 if not TELEGRAM_TOKEN:
     print("❌ ERROR: TELEGRAM_TOKEN missing in .env file!")
@@ -1425,7 +1425,7 @@ async def view_results_analytics(update: Update, context: ContextTypes.DEFAULT_T
     return TEACHER_MENU
 
 # ============================================================================
-# STUDENT HANDLERS
+# STUDENT HANDLERS - FIXED REQUIRED FIELDS ISSUE
 # ============================================================================
 
 async def student_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1466,7 +1466,7 @@ async def find_assignment_start(update: Update, context: ContextTypes.DEFAULT_TY
     return FIND_ASSIGNMENT
 
 async def handle_assignment_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle student entering assignment code"""
+    """Handle student entering assignment code - FIXED REQUIRED FIELDS ISSUE"""
     code = update.message.text.strip().upper()
     
     # Find assignment
@@ -1511,58 +1511,74 @@ async def handle_assignment_code(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data['current_qtype'] = qtype
     context.user_data['correct_answers'] = answers
     
-    # Parse required fields from database
-    try:
-        if required_fields_json:
-            context.user_data['required_fields'] = json.loads(required_fields_json)
-        else:
-            context.user_data['required_fields'] = []
-    except:
-        context.user_data['required_fields'] = []
+    # Parse required fields from database - FIXED THIS PART
+    required_fields = []
+    if required_fields_json:
+        try:
+            required_fields = json.loads(required_fields_json)
+            if not isinstance(required_fields, list):
+                required_fields = []
+        except:
+            required_fields = []
+    
+    context.user_data['required_fields'] = required_fields
     
     deadline_info = f"\n⏰ **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
     
-    keyboard = [
-        [InlineKeyboardButton("📝 Submit Answer", callback_data="submit_answer")],
-        [InlineKeyboardButton("🔙 Back", callback_data="student_menu")]
-    ]
-    
-    await update.message.reply_text(
-        f"✅ **ASSIGNMENT FOUND!**\n\n"
-        f"📌 **Title:** {title}\n"
-        f"❓ **Question:** {question}\n"
-        f"📊 **Max Score:** {max_score}/{scale}{deadline_info}\n\n"
-        f"Ready to answer?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-    
-    return FIND_ASSIGNMENT
-
-async def submit_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Student submits answer"""
-    query = update.callback_query
-    await query.answer()
-    
-    # Check if there are required fields
-    required_fields = context.user_data.get('required_fields', [])
-    
+    # Check if there are required fields - FIXED LOGIC
     if required_fields:
-        # Collect required details first
+        # Start collecting required details
         context.user_data['fill_details_step'] = 0
         context.user_data['student_details'] = {}
         context.user_data['fields_to_fill'] = required_fields
         
         # Ask for first field
         first_field = required_fields[0]
-        await query.edit_message_text(
+        await update.message.reply_text(
             f"📋 **REQUIRED INFORMATION**\n\n"
             f"Question 1/{len(required_fields)}\n"
             f"Enter your **{first_field}**:"
         )
         return STUDENT_FILL_DETAILS
     else:
-        # No required details, go straight to answer submission
+        # No required details, show assignment and go to answer submission
+        keyboard = [
+            [InlineKeyboardButton("📝 Submit Answer", callback_data="submit_answer")],
+            [InlineKeyboardButton("🔙 Back", callback_data="student_menu")]
+        ]
+        
+        await update.message.reply_text(
+            f"✅ **ASSIGNMENT FOUND!**\n\n"
+            f"📌 **Title:** {title}\n"
+            f"❓ **Question:** {question}\n"
+            f"📊 **Max Score:** {max_score}/{scale}{deadline_info}\n\n"
+            f"Ready to answer?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return FIND_ASSIGNMENT
+
+async def submit_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Student submits answer"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Check if there are required fields that haven't been filled
+    required_fields = context.user_data.get('required_fields', [])
+    student_details = context.user_data.get('student_details', {})
+    
+    if required_fields and len(student_details) < len(required_fields):
+        # Should not happen normally, but as a safety check
+        first_field = required_fields[len(student_details)]
+        await query.edit_message_text(
+            f"📋 **REQUIRED INFORMATION**\n\n"
+            f"Question {len(student_details) + 1}/{len(required_fields)}\n"
+            f"Enter your **{first_field}**:"
+        )
+        context.user_data['fill_details_step'] = len(student_details)
+        return STUDENT_FILL_DETAILS
+    else:
+        # No required details or all filled, go to answer submission
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="student_menu")]]
         await query.edit_message_text(
             "📝 **SUBMIT YOUR ANSWER**\n\n"
@@ -1575,7 +1591,7 @@ async def submit_answer_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return ANSWER_SUBMISSION
 
 async def handle_student_fill_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle student filling required details"""
+    """Handle student filling required details - FIXED VERSION"""
     text = update.message.text.strip()
     step = context.user_data.get('fill_details_step', 0)
     fields_to_fill = context.user_data.get('fields_to_fill', [])
@@ -1595,16 +1611,38 @@ async def handle_student_fill_details(update: Update, context: ContextTypes.DEFA
             )
             return STUDENT_FILL_DETAILS
         else:
-            # All details collected, now ask for answer
-            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="student_menu")]]
-            await update.message.reply_text(
-                f"✅ **All information saved!**\n\n"
-                "📝 **Now, submit your answer:**",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-            context.user_data['mode'] = 'submit_answer'
-            return ANSWER_SUBMISSION
+            # All details collected, now show assignment and ask for answer
+            keyboard = [[InlineKeyboardButton("📝 Submit Answer", callback_data="submit_answer")]]
+            
+            # Get assignment details for display
+            assignment_id = context.user_data['current_assignment_id']
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute('''SELECT title, question, max_score, grading_scale 
+                         FROM assignments WHERE assignment_id=%s''', (assignment_id,))
+            assign = cur.fetchone()
+            cur.close()
+            conn.close()
+            
+            if assign:
+                title, question, max_score, scale = assign
+                await update.message.reply_text(
+                    f"✅ **All information saved!**\n\n"
+                    f"📌 **Assignment:** {title}\n"
+                    f"❓ **Question:** {question}\n"
+                    f"📊 **Max Score:** {max_score}/{scale}\n\n"
+                    f"Now submit your answer:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ **All information saved!**\n\n"
+                    f"Now submit your answer:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+            return FIND_ASSIGNMENT
 
 async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process student answer submission"""
@@ -1665,6 +1703,235 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     )
     
     return STUDENT_MAIN
+
+# ============================================================================
+# VIEW SUBMISSIONS AND EXPORT FEATURES - NEW
+# ============================================================================
+
+async def handle_view_submissions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle view all submissions for an assignment"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract assignment ID from callback data
+    callback_data = query.data
+    assign_id_prefix = callback_data.replace("view_subs_", "")
+    
+    teacher_id = context.user_data.get('teacher_id')
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Get assignment title
+    cur.execute('''SELECT assignment_id, title FROM assignments 
+                 WHERE teacher_id=%s AND assignment_id LIKE %s''', 
+              (teacher_id, f"{assign_id_prefix}%"))
+    assign = cur.fetchone()
+    
+    if not assign:
+        await query.edit_message_text("❌ Assignment not found.")
+        return TEACHER_MENU
+    
+    assignment_id, title = assign
+    
+    # Get all submissions
+    cur.execute('''SELECT submission_id, student_name, student_id, answer, score, max_score, submitted_at, student_details
+                 FROM submissions 
+                 WHERE assignment_id=%s
+                 ORDER BY submitted_at DESC''', (assignment_id,))
+    submissions = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    context.user_data['current_export_assignment_id'] = assignment_id
+    context.user_data['current_export_title'] = title
+    
+    if not submissions:
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="my_assignments")]]
+        await query.edit_message_text(
+            "📭 **No submissions yet for this assignment.**",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return TEACHER_MENU
+    
+    # Format submissions list
+    text = f"📊 **SUBMISSIONS FOR: {title}**\n\n"
+    text += f"Total submissions: {len(submissions)}\n\n"
+    
+    for i, (subm_id, student_name, student_id, answer, score, max_score, submitted_at, student_details) in enumerate(submissions[:10], 1):
+        score_display = format_score_with_color(score, max_score)
+        time_str = submitted_at.strftime("%m/%d %H:%M")
+        
+        # Add student details if available
+        details_str = ""
+        if student_details:
+            try:
+                details = json.loads(student_details)
+                if details:
+                    details_str = " | " + ", ".join([f"{k}: {v}" for k, v in details.items()])
+            except:
+                pass
+        
+        text += f"{i}. {student_name}{details_str}\n"
+        text += f"   {score_display} | {time_str}\n\n"
+    
+    if len(submissions) > 10:
+        text += f"... and {len(submissions) - 10} more submissions\n\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("📤 Export to Excel", callback_data="export_excel")],
+        [InlineKeyboardButton("🔙 Back to Assignments", callback_data="my_assignments")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    return TEACHER_MENU
+
+async def handle_export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export submissions to Excel format"""
+    query = update.callback_query
+    await query.answer()
+    
+    assignment_id = context.user_data.get('current_export_assignment_id')
+    title = context.user_data.get('current_export_title', 'Assignment')
+    
+    if not assignment_id:
+        await query.edit_message_text("❌ No assignment selected for export.")
+        return TEACHER_MENU
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Get all submissions with details
+    cur.execute('''SELECT student_name, student_id, answer, score, max_score, submitted_at, student_details
+                 FROM submissions 
+                 WHERE assignment_id=%s
+                 ORDER BY submitted_at''', (assignment_id,))
+    submissions = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    if not submissions:
+        await query.edit_message_text("❌ No submissions to export.")
+        return TEACHER_MENU
+    
+    try:
+        import pandas as pd
+        
+        # Prepare data for Excel
+        data = []
+        for subm in submissions:
+            student_name, student_id, answer, score, max_score, submitted_at, student_details = subm
+            
+            # Base fields
+            row = {
+                'Student Name': student_name,
+                'Telegram ID': student_id,
+                'Answer': answer,
+                'Score': score,
+                'Max Score': max_score,
+                'Percentage': f"{(score/max_score*100):.1f}%" if max_score > 0 else "0%",
+                'Submitted At': submitted_at.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # Add custom student details
+            if student_details:
+                try:
+                    details_dict = json.loads(student_details)
+                    for key, value in details_dict.items():
+                        row[key] = value
+                except:
+                    pass
+            
+            data.append(row)
+        
+        # Create DataFrame
+        df = pd.DataFrame(data)
+        
+        # Create Excel file in memory
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Submissions', index=False)
+        
+        output.seek(0)
+        
+        # Send file
+        filename = f"{title.replace(' ', '_')}_submissions.xlsx"
+        await query.message.reply_document(
+            document=InputFile(output, filename=filename),
+            caption=f"📊 **Submissions Export**\n\n"
+                   f"📌 {title}\n"
+                   f"👥 {len(submissions)} students\n"
+                   f"📅 Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        
+        await query.delete_message()
+        
+    except ImportError:
+        # Fallback to CSV if pandas is not available
+        import csv
+        
+        output = BytesIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        if submissions and submissions[0][6]:  # student_details exists
+            try:
+                details_dict = json.loads(submissions[0][6])
+                header = ['Student Name', 'Telegram ID', 'Answer', 'Score', 'Max Score', 'Percentage', 'Submitted At'] + list(details_dict.keys())
+            except:
+                header = ['Student Name', 'Telegram ID', 'Answer', 'Score', 'Max Score', 'Percentage', 'Submitted At']
+        else:
+            header = ['Student Name', 'Telegram ID', 'Answer', 'Score', 'Max Score', 'Percentage', 'Submitted At']
+        
+        writer.writerow(header)
+        
+        # Write data
+        for subm in submissions:
+            student_name, student_id, answer, score, max_score, submitted_at, student_details = subm
+            
+            row = [
+                student_name,
+                student_id,
+                answer,
+                score,
+                max_score,
+                f"{(score/max_score*100):.1f}%" if max_score > 0 else "0%",
+                submitted_at.strftime("%Y-%m-%d %H:%M:%S")
+            ]
+            
+            # Add custom details
+            if student_details:
+                try:
+                    details_dict = json.loads(student_details)
+                    for key in header[7:]:  # Only include keys that are in header
+                        row.append(details_dict.get(key, ''))
+                except:
+                    pass
+            
+            writer.writerow(row)
+        
+        output.seek(0)
+        filename = f"{title.replace(' ', '_')}_submissions.csv"
+        
+        await query.message.reply_document(
+            document=InputFile(output, filename=filename),
+            caption=f"📊 **Submissions Export (CSV)**\n\n"
+                   f"📌 {title}\n"
+                   f"👥 {len(submissions)} students\n"
+                   f"📅 Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        
+        await query.delete_message()
+    
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error generating export: {str(e)}")
+    
+    return TEACHER_MENU
 
 # ============================================================================
 # QUICK GRADE (FOR ANYONE)
@@ -1877,6 +2144,7 @@ This is an intelligent examination and assignment management system designed for
 • ✏️ Edit assignments after creation
 • 🗑️ Delete assignments and manage submissions
 • 🗄️ **NEW: PostgreSQL Database** for better performance and reliability
+• 📤 **NEW: Export submissions to Excel**
 
 ═══════════════════════════════════════════════════════════════
 
@@ -1926,6 +2194,12 @@ This is an intelligent examination and assignment management system designed for
 • See submission count per assignment
 • View average scores
 • Check overall statistics
+
+**📤 Exporting Data:**
+• View submissions for any assignment
+• Export to Excel with one click
+• Includes all student details and scores
+• Perfect for record-keeping and analysis
 
 **⚡ Quick Grade:**
 • One-off grading without creating assignments
@@ -2044,6 +2318,8 @@ All features working:
 ✅ Real-time results
 ✅ Quick grading mode
 ✅ Database for storing datas
+✅ View all submissions
+✅ Export to Excel
 
 ═══════════════════════════════════════════════════════════════
 
@@ -2110,6 +2386,8 @@ def main():
                 CallbackQueryHandler(handle_edit_assign, pattern="^edit_assign_"),
                 CallbackQueryHandler(handle_delete_assign, pattern="^delete_assign_"),
                 CallbackQueryHandler(handle_deactivate_assign, pattern="^(de)?activate_assign_"),
+                CallbackQueryHandler(handle_view_submissions, pattern="^view_subs_"),
+                CallbackQueryHandler(handle_export_excel, pattern="^export_excel$"),
             ],
             CREATE_QUESTION: [
                 CallbackQueryHandler(handle_assignment_type, pattern="^type_"),
@@ -2164,6 +2442,7 @@ def main():
     print("✅ NEW: PostgreSQL database for better performance and reliability!")
     print("✅ FIXED: Teacher login now working properly!")
     print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
+    print("✅ NEW: View All Submissions | Export to Excel")
     print("\n📍 Waiting for users...\n")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
