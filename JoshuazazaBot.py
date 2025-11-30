@@ -99,6 +99,10 @@ if not TELEGRAM_TOKEN:
     print("❌ ERROR: TELEGRAM_TOKEN missing in .env file!")
     sys.exit(1)
 
+if not DATABASE_URL:
+    print("❌ ERROR: DATABASE_URL missing in environment variables!")
+    sys.exit(1)
+
 # Initialize Gemini if API key available
 GEMINI_MODEL = None
 if GEMINI_API_KEY and GEMINI_AVAILABLE:
@@ -131,42 +135,47 @@ def get_db_connection():
 
 def init_db():
     """Initialize PostgreSQL database with teacher accounts"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Teachers table
-    cur.execute('''CREATE TABLE IF NOT EXISTS teachers
-        (teacher_id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE, username TEXT UNIQUE,
-         password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
-    
-    # Questions/Assignments table - EXPANDED
-    cur.execute('''CREATE TABLE IF NOT EXISTS assignments
-        (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
-         title TEXT, question TEXT, question_type TEXT, 
-         max_score INT, grading_scale INT, created_at TIMESTAMP, 
-         answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
-         required_fields JSONB, is_active INTEGER DEFAULT 1,
-         FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
-    
-    # Student submissions - EXPANDED
-    cur.execute('''CREATE TABLE IF NOT EXISTS submissions
-        (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
-         student_id BIGINT, answer TEXT, score REAL, max_score INT,
-         grading_details JSONB, submitted_at TIMESTAMP, student_details JSONB,
-         FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
-    
-    # Quick grading cache
-    cur.execute('''CREATE TABLE IF NOT EXISTS quick_grades
-        (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
-         answer_given TEXT, score REAL, max_score INT,
-         graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    print("✅ PostgreSQL database initialized successfully!")
-    return True
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Teachers table
+        cur.execute('''CREATE TABLE IF NOT EXISTS teachers
+            (teacher_id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE, username TEXT UNIQUE,
+             password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
+        
+        # Questions/Assignments table - EXPANDED
+        cur.execute('''CREATE TABLE IF NOT EXISTS assignments
+            (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
+             title TEXT, question TEXT, question_type TEXT, 
+             max_score INT, grading_scale INT, created_at TIMESTAMP, 
+             answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
+             required_fields JSONB, is_active INTEGER DEFAULT 1,
+             FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+        
+        # Student submissions - EXPANDED
+        cur.execute('''CREATE TABLE IF NOT EXISTS submissions
+            (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
+             student_id BIGINT, answer TEXT, score REAL, max_score INT,
+             grading_details JSONB, submitted_at TIMESTAMP, student_details JSONB,
+             FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
+        
+        # Quick grading cache
+        cur.execute('''CREATE TABLE IF NOT EXISTS quick_grades
+            (grade_id TEXT PRIMARY KEY, teacher_id INT, question TEXT,
+             answer_given TEXT, score REAL, max_score INT,
+             graded_at TIMESTAMP, FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        print("✅ PostgreSQL database initialized successfully!")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Database initialization error: {e}")
+        return False
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -1262,7 +1271,7 @@ async def handle_edit_deadline(update: Update, context: ContextTypes.DEFAULT_TYP
     return CREATE_QUESTION
 
 async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input for edit fields (title, question, answer)"""
+    """Handle text input for edit fields (title, question, answer) - with proper error handling"""
     text = update.message.text.strip()
     edit_mode = context.user_data.get('edit_mode')
     assignment_id = context.user_data.get('edit_assign_id')
@@ -1271,73 +1280,82 @@ async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Session error. Please try again.")
         return TEACHER_MENU
     
-    if edit_mode == 'title':
-        # Update title
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('UPDATE assignments SET title=%s WHERE assignment_id=%s', (text, assignment_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-        await update.message.reply_text("✅ Title updated successfully!")
-        
-    elif edit_mode == 'question':
-        # Update question
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('UPDATE assignments SET question=%s WHERE assignment_id=%s', (text, assignment_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-        await update.message.reply_text("✅ Question updated successfully!")
-        
-    elif edit_mode == 'answer':
-        # Update answer
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('UPDATE assignments SET answers=%s WHERE assignment_id=%s', (text, assignment_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-        await update.message.reply_text("✅ Correct answer updated successfully!")
-        
-    elif edit_mode == 'score':
-        # Update max score
-        try:
-            score = int(text)
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute('UPDATE assignments SET max_score=%s WHERE assignment_id=%s', (score, assignment_id))
-            conn.commit()
-            cur.close()
-            conn.close()
-            await update.message.reply_text(f"✅ Max score updated to {score}!")
-        except ValueError:
-            await update.message.reply_text("❌ Please enter a valid number for max score")
-            return CREATE_QUESTION
+    conn = None
+    cur = None
     
-    elif edit_mode == 'deadline':
-        try:
-            # Parse deadline date in format: YYYY-MM-DD HH:MM or YYYY-MM-DD
-            deadline_str = text.strip()
-            if len(deadline_str) == 10:  # Only date provided
-                deadline_str += " 23:59"
-            deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
-            if deadline_dt <= datetime.now():
-                await update.message.reply_text("❌ Deadline must be in the future. Try again (format: YYYY-MM-DD HH:MM)")
-                return CREATE_QUESTION
-            
-            # Update deadline
+    try:
+        if edit_mode == 'title':
+            # Update title
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute('UPDATE assignments SET deadline_at=%s WHERE assignment_id=%s', (deadline_dt, assignment_id))
+            cur.execute('UPDATE assignments SET title=%s WHERE assignment_id=%s', (text, assignment_id))
             conn.commit()
-            cur.close()
-            conn.close()
-            await update.message.reply_text(f"✅ Deadline updated to {get_deadline_string(deadline_dt)}!")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid date format. Use: YYYY-MM-DD or YYYY-MM-DD HH:MM")
-            return CREATE_QUESTION
+            await update.message.reply_text("✅ Title updated successfully!")
+            
+        elif edit_mode == 'question':
+            # Update question
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute('UPDATE assignments SET question=%s WHERE assignment_id=%s', (text, assignment_id))
+            conn.commit()
+            await update.message.reply_text("✅ Question updated successfully!")
+            
+        elif edit_mode == 'answer':
+            # Update answer
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute('UPDATE assignments SET answers=%s WHERE assignment_id=%s', (text, assignment_id))
+            conn.commit()
+            await update.message.reply_text("✅ Correct answer updated successfully!")
+            
+        elif edit_mode == 'score':
+            # Update max score
+            try:
+                score = int(text)
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute('UPDATE assignments SET max_score=%s WHERE assignment_id=%s', (score, assignment_id))
+                conn.commit()
+                await update.message.reply_text(f"✅ Max score updated to {score}!")
+            except ValueError:
+                await update.message.reply_text("❌ Please enter a valid number for max score")
+                return CREATE_QUESTION
+        
+        elif edit_mode == 'deadline':
+            try:
+                # Parse deadline date in format: YYYY-MM-DD HH:MM or YYYY-MM-DD
+                deadline_str = text.strip()
+                if len(deadline_str) == 10:  # Only date provided
+                    deadline_str += " 23:59"
+                deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
+                if deadline_dt <= datetime.now():
+                    await update.message.reply_text("❌ Deadline must be in the future. Try again (format: YYYY-MM-DD HH:MM)")
+                    return CREATE_QUESTION
+                
+                # Update deadline
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute('UPDATE assignments SET deadline_at=%s WHERE assignment_id=%s', (deadline_dt, assignment_id))
+                conn.commit()
+                await update.message.reply_text(f"✅ Deadline updated to {get_deadline_string(deadline_dt)}!")
+            except ValueError:
+                await update.message.reply_text("❌ Invalid date format. Use: YYYY-MM-DD or YYYY-MM-DD HH:MM")
+                return CREATE_QUESTION
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error updating assignment: {str(e)}")
+    finally:
+        # Ensure connections are closed
+        try:
+            if cur:
+                cur.close()
+        except:
+            pass
+        try:
+            if conn:
+                conn.close()
+        except:
+            pass
     
     # Clear edit mode and return to menu
     context.user_data['edit_mode'] = None
@@ -1646,18 +1664,87 @@ async def handle_student_fill_details(update: Update, context: ContextTypes.DEFA
             return FIND_ASSIGNMENT
 
 async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process student answer submission"""
+    """Process student answer submission - supports text, voice, and images"""
     student_id = update.message.from_user.id
     student_name = update.message.from_user.first_name
     
-    # Get answer
-    if update.message.text:
-        answer = update.message.text
+    answer = None
+    answer_source = "text"
+    
+    # ============= VOICE SUPPORT =============
+    if update.message.voice:
+        if not VOICE_SUPPORT:
+            await update.message.reply_text("⚠️ Voice recognition temporarily unavailable.")
+            return ANSWER_SUBMISSION
+        
+        try:
+            file = await update.message.voice.get_file()
+            voice_bytes = await file.download_as_bytearray()
+            
+            # Convert bytes to audio
+            audio = sr.AudioData(voice_bytes, 16000, 2)
+            text = SPEECH_RECOGNIZER.recognize_google(audio)
+            answer = text.strip()
+            answer_source = "voice"
+            
+            await update.message.reply_text(
+                f"🎤 **Voice recognized:**\n\n{answer}\n\n_Processing your answer..._"
+            )
+        except sr.UnknownValueError:
+            await update.message.reply_text(
+                "❌ Could not understand your voice. Please speak clearly and try again, or type your answer instead."
+            )
+            return ANSWER_SUBMISSION
+        except Exception as e:
+            await update.message.reply_text(
+                f"⚠️ Voice recognition error: {str(e)}\n\nPlease try typing your answer instead."
+            )
+            return ANSWER_SUBMISSION
+    
+    # ============= IMAGE/SCREENSHOT SUPPORT =============
+    elif update.message.photo:
+        if not USE_EMBEDDINGS:  # Simple check for PIL availability
+            await update.message.reply_text("⚠️ Image OCR temporarily unavailable.")
+            return ANSWER_SUBMISSION
+        
+        try:
+            photo = update.message.photo[-1]  # Get highest resolution
+            file = await photo.get_file()
+            img_bytes = await file.download_as_bytearray()
+            
+            # Extract text from image
+            img = Image.open(BytesIO(img_bytes))
+            text = pytesseract.image_to_string(img)
+            
+            if not text.strip():
+                await update.message.reply_text(
+                    "❌ No text found in the image. Please ensure the image contains readable text or type your answer instead."
+                )
+                return ANSWER_SUBMISSION
+            
+            answer = text.strip()
+            answer_source = "image"
+            
+            preview = answer[:500] + "..." if len(answer) > 500 else answer
+            await update.message.reply_text(
+                f"🖼️ **Text extracted from image:**\n\n{preview}\n\n_Processing your answer..._"
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"⚠️ Image processing error: {str(e)}\n\nPlease try uploading a clearer image or type your answer."
+            )
+            return ANSWER_SUBMISSION
+    
+    # ============= TEXT SUPPORT =============
+    elif update.message.text:
+        answer = update.message.text.strip()
+        answer_source = "text"
+    
     else:
-        await update.message.reply_text("❌ Please send a text answer")
+        await update.message.reply_text("❌ Please send a text answer, voice message, or image.")
         return ANSWER_SUBMISSION
     
-    # Grade answer
+    # ============= GRADE THE ANSWER =============
     assignment_id = context.user_data['current_assignment_id']
     max_score = context.user_data['current_max_score']
     qtype = context.user_data['current_qtype']
@@ -1690,12 +1777,14 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     conn.close()
     
     score_colored = format_score_with_color(score, max_score)
+    source_emoji = {"voice": "🎤", "image": "🖼️", "text": "📝"}
     
     keyboard = [[InlineKeyboardButton("🔍 Find Another", callback_data="find_assignment")],
                 [InlineKeyboardButton("🏠 Back to Menu", callback_data="student_menu")]]
     
     await update.message.reply_text(
         f"✅ **ANSWER SUBMITTED!**\n\n"
+        f"📤 **Submitted via:** {source_emoji.get(answer_source, '📝')} {answer_source.title()}\n"
         f"📊 **Your Score:** {score_colored}\n"
         f"💡 **Feedback:** {detail}\n\n"
         f"What's next?",
@@ -1704,6 +1793,7 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     )
     
     return STUDENT_MAIN
+
 
 # ============================================================================
 # VIEW SUBMISSIONS AND EXPORT FEATURES - NEW & FIXED
@@ -1759,30 +1849,26 @@ async def handle_view_submissions(update: Update, context: ContextTypes.DEFAULT_
     text = f"📊 **SUBMISSIONS FOR: {title}**\n\n"
     text += f"Total submissions: {len(submissions)}\n\n"
     
-    for i, (subm_id, student_name, student_id, answer, score, max_score, submitted_at, student_details) in enumerate(submissions[:10], 1):
+    # Format submissions list with clickable view buttons
+    text = f"📊 **SUBMISSIONS FOR: {title}**\n\n"
+    text += f"Total submissions: {len(submissions)}\n\n"
+    
+    keyboard = []
+    
+    # Add view buttons for each submission (limit to 20 to avoid too many buttons)
+    for subm_id, student_name, student_id, answer, score, max_score, submitted_at, student_details in submissions[:20]:
         score_display = format_score_with_color(score, max_score)
         time_str = submitted_at.strftime("%m/%d %H:%M")
+        name_short = (student_name or "Anonymous")[:20]
         
-        # Add student details if available
-        details_str = ""
-        if student_details:
-            try:
-                details = json.loads(student_details)
-                if details:
-                    details_str = " | " + ", ".join([f"{k}: {v}" for k, v in details.items()])
-            except:
-                pass
-        
-        text += f"{i}. {student_name}{details_str}\n"
-        text += f"   {score_display} | {time_str}\n\n"
+        btn_text = f"👁 {name_short}: {score_display}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"view_detail_{subm_id}")])
     
-    if len(submissions) > 10:
-        text += f"... and {len(submissions) - 10} more submissions\n\n"
+    if len(submissions) > 20:
+        text += f"📌 Showing first 20 of {len(submissions)} submissions\n\n"
     
-    keyboard = [
-        [InlineKeyboardButton("📤 Export to Excel", callback_data=f"export_excel_{assignment_id}")],
-        [InlineKeyboardButton("🔙 Back to Assignments", callback_data="my_assignments")]
-    ]
+    keyboard.append([InlineKeyboardButton("📤 Export to Excel", callback_data=f"export_excel_{assignment_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Assignments", callback_data="my_assignments")])
     
     await query.edit_message_text(
         text,
@@ -1985,6 +2071,84 @@ async def handle_quick_grade(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except ValueError:
             await update.message.reply_text("❌ Please enter a valid number")
             return QUICK_GRADE_MENU
+
+# ============================================================================
+# SUBMISSION REVIEW - TEACHERS CAN VIEW STUDENT ANSWERS
+# ============================================================================
+
+async def handle_view_submission_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View detailed submission information for a specific student"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract submission_id from callback data
+    submission_id = query.data.replace("view_detail_", "")
+    
+    conn = get_db_connection()
+    cur = conn.cursor(row_factory=dict_row)
+    
+    try:
+        # Get submission with assignment details
+        cur.execute("""
+            SELECT s.*, a.title, a.question, a.max_score
+            FROM submissions s 
+            JOIN assignments a ON s.assignment_id = a.assignment_id 
+            WHERE s.submission_id = %s
+        """, (submission_id,))
+        
+        sub = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not sub:
+            await query.edit_message_text("❌ Submission not found.")
+            return TEACHER_MENU
+        
+        # Parse student details
+        details = sub['student_details'] or {}
+        details_text = ""
+        if details:
+            for key, val in details.items():
+                key_display = key.replace("_", " ").title()
+                details_text += f"• **{key_display}:** {val}\n"
+        
+        # Format submission time
+        submitted_time = sub['submitted_at']
+        if isinstance(submitted_time, str):
+            submitted_time = datetime.fromisoformat(submitted_time)
+        time_str = submitted_time.strftime("%b %d, %H:%M")
+        
+        # Build detailed text
+        text = "📋 **SUBMISSION DETAILS**\n\n"
+        text += f"📌 **Assignment:** {sub['title']}\n"
+        text += f"👤 **Student:** {sub['student_name'] or 'Anonymous'}\n"
+        text += f"📊 **Score:** {format_score_with_color(sub['score'], sub['max_score'])}\n"
+        text += f"📅 **Submitted:** {time_str}\n\n"
+        
+        if details_text:
+            text += f"**📋 Student Information:**\n{details_text}\n"
+        
+        text += f"**❓ Question:**\n{sub['question']}\n\n"
+        
+        # Truncate long answers
+        answer_text = sub['answer'] or "No answer provided"
+        if len(answer_text) > 1500:
+            text += f"**✍️ Answer:**\n{answer_text[:1500]}...\n\n_(Answer truncated)_"
+        else:
+            text += f"**✍️ Answer:**\n{answer_text}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Submissions", callback_data="my_assignments")]]
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error loading submission: {str(e)}")
+    
+    return TEACHER_MENU
 
 # ============================================================================
 # NAVIGATION HANDLERS
@@ -2340,6 +2504,7 @@ def main():
                 CallbackQueryHandler(handle_deactivate_assign, pattern="^(de)?activate_assign_"),
                 CallbackQueryHandler(handle_view_submissions, pattern="^view_subs_"),
                 CallbackQueryHandler(handle_export_excel, pattern="^export_excel_"),
+                CallbackQueryHandler(handle_view_submission_details, pattern="^view_detail_"),  # NEW: View submission details
             ],
             CREATE_QUESTION: [
                 CallbackQueryHandler(handle_assignment_type, pattern="^type_"),
@@ -2374,6 +2539,8 @@ def main():
             ],
             ANSWER_SUBMISSION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_student_answer),
+                MessageHandler(filters.VOICE, process_student_answer),  # NEW: Voice answer support
+                MessageHandler(filters.PHOTO, process_student_answer),  # NEW: Image/OCR answer support
             ],
             QUICK_GRADE_MENU: [
                 CallbackQueryHandler(back_to_start, pattern="^back_to_start$"),
