@@ -16,6 +16,7 @@ import pytesseract
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -137,7 +138,7 @@ def init_db():
          title TEXT, question TEXT, question_type TEXT, 
          max_score INT, grading_scale INT, created_at TIMESTAMP, 
          answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
-         required_fields JSONB, is_active BOOLEAN DEFAULT TRUE,
+         required_fields JSONB, is_active INTEGER DEFAULT 1,
          FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
     
     # Student submissions - EXPANDED
@@ -681,18 +682,19 @@ async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Create assignment
     assignment_id = str(uuid.uuid4())
     code = generate_assignment_code()
-    required_fields = json.dumps(context.user_data.get('required_fields', []))
+    required_fields = Json(context.user_data.get('required_fields', []))
     deadline_at = context.user_data.get('assign_deadline')
     
     cur.execute('''INSERT INTO assignments 
                 (assignment_id, teacher_id, code, title, question, 
                  question_type, max_score, grading_scale, created_at, answers, 
-                 required_fields, deadline_at, is_active)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+                 rubric, required_fields, deadline_at, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
               (assignment_id, teacher_id, code, context.user_data['assign_title'],
                context.user_data['assign_question'], context.user_data['assign_type'],
                max_score, scale, datetime.now(), context.user_data['assign_answer'],
-               required_fields, deadline_at, 1))
+               Json({}),  # rubric (empty dict)
+               required_fields, deadline_at, 1))  # is_active as integer
     conn.commit()
     cur.close()
     conn.close()
@@ -1082,11 +1084,11 @@ async def handle_deactivate_assign(update: Update, context: ContextTypes.DEFAULT
     
     assignment_id = context.user_data.get('edit_assign_id')
     action = query.data.replace("activate_assign", "").replace("deactivate_assign", "")
-    is_active = 0 if "deactivate" in query.data else True
+    is_active = False if "deactivate" in query.data else True
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (is_active, assignment_id))
+    cur.execute('UPDATE assignments SET is_active=%s WHERE assignment_id=%s', (1 if is_active else 0, assignment_id))
     conn.commit()
     cur.close()
     conn.close()
@@ -1639,9 +1641,11 @@ async def process_student_answer(update: Update, context: ContextTypes.DEFAULT_T
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('''INSERT INTO submissions
-                (submission_id, assignment_id, student_name, student_id, answer, score, max_score, submitted_at, student_details)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-              (submission_id, assignment_id, student_name, student_id, answer, score, max_score, datetime.now(), json.dumps(student_details)))
+                (submission_id, assignment_id, student_name, student_id, answer, 
+                 score, max_score, submitted_at, student_details, grading_details)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+              (submission_id, assignment_id, student_name, student_id, answer, 
+               score, max_score, datetime.now(), Json(student_details or {}), Json({})))
     conn.commit()
     cur.close()
     conn.close()
