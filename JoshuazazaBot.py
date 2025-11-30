@@ -1,6 +1,6 @@
 # ============================================================================
 # JOSHUAZAZA GRADE BOT - v2.1
-# MIGRATED FROM SQLITE TO POSTGRESQL - COMPLETELY FIXED VERSION
+# MIGRATED FROM SQLITE TO POSTGRESQL - FIXED VERSION
 # ============================================================================
 
 import os
@@ -114,7 +114,7 @@ if os.name == "nt":
  EDIT_ASSIGNMENT, VIEW_SUBMISSION_DETAILS, STUDENT_FILL_DETAILS) = range(18)
 
 # ============================================================================
-# DATABASE SETUP - POSTGRESQL - FIXED
+# DATABASE SETUP - POSTGRESQL
 # ============================================================================
 
 def get_db_connection():
@@ -122,7 +122,7 @@ def get_db_connection():
     return psycopg.connect(DATABASE_URL)
 
 def init_db():
-    """Initialize PostgreSQL database with teacher accounts - FIXED SCHEMA"""
+    """Initialize PostgreSQL database with teacher accounts"""
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -131,20 +131,20 @@ def init_db():
         (teacher_id SERIAL PRIMARY KEY, telegram_id BIGINT UNIQUE, username TEXT UNIQUE,
          password TEXT, full_name TEXT, created_at TIMESTAMP, grading_scale INT DEFAULT 100)''')
     
-    # Questions/Assignments table - FIXED: answers as TEXT instead of JSONB
+    # Questions/Assignments table - EXPANDED
     cur.execute('''CREATE TABLE IF NOT EXISTS assignments
         (assignment_id TEXT PRIMARY KEY, teacher_id INT, code TEXT UNIQUE,
          title TEXT, question TEXT, question_type TEXT, 
          max_score INT, grading_scale INT, created_at TIMESTAMP, 
-         answers TEXT, rubric TEXT, deadline_at TIMESTAMP, 
-         required_fields TEXT, is_active BOOLEAN DEFAULT TRUE,
+         answers TEXT, rubric JSONB, deadline_at TIMESTAMP, 
+         required_fields JSONB, is_active BOOLEAN DEFAULT TRUE,
          FOREIGN KEY(teacher_id) REFERENCES teachers(teacher_id))''')
     
-    # Student submissions - FIXED: grading_details and student_details as TEXT
+    # Student submissions - EXPANDED
     cur.execute('''CREATE TABLE IF NOT EXISTS submissions
         (submission_id TEXT PRIMARY KEY, assignment_id TEXT, student_name TEXT,
          student_id BIGINT, answer TEXT, score REAL, max_score INT,
-         grading_details TEXT, submitted_at TIMESTAMP, student_details TEXT,
+         grading_details JSONB, submitted_at TIMESTAMP, student_details JSONB,
          FOREIGN KEY(assignment_id) REFERENCES assignments(assignment_id))''')
     
     # Quick grading cache
@@ -669,98 +669,56 @@ async def create_assignment_start(update: Update, context: ContextTypes.DEFAULT_
     return CREATE_QUESTION
 
 async def finalize_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE, teacher_id):
-    """Finalize and save assignment to database - FIXED"""
+    """Finalize and save assignment to database"""
     max_score = context.user_data.get('assign_max_score')
     
     # Get teacher's grading scale
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT grading_scale FROM teachers WHERE teacher_id=%s", (teacher_id,))
-    result = cur.fetchone()
-    if not result:
-        await update.message.reply_text("❌ Teacher not found. Please login again.")
-        return TEACHER_MENU
-    scale = result[0]
+    scale = cur.fetchone()[0]
     
     # Create assignment
     assignment_id = str(uuid.uuid4())
     code = generate_assignment_code()
-    
-    # Handle required fields - convert to JSON string
-    required_fields_list = context.user_data.get('required_fields', [])
-    required_fields = json.dumps(required_fields_list) if required_fields_list else None
-    
+    required_fields = json.dumps(context.user_data.get('required_fields', []))
     deadline_at = context.user_data.get('assign_deadline')
     
-    try:
-        cur.execute('''INSERT INTO assignments 
-                    (assignment_id, teacher_id, code, title, question, 
-                     question_type, max_score, grading_scale, created_at, answers, 
-                     required_fields, deadline_at, is_active)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
-                  (assignment_id, teacher_id, code, 
-                   context.user_data.get('assign_title', 'Untitled'),
-                   context.user_data.get('assign_question', 'No question'),
-                   context.user_data.get('assign_type', 'Short Answer'),
-                   max_score, scale, datetime.now(), 
-                   context.user_data.get('assign_answer', 'No answer'),
-                   required_fields, deadline_at, True))
-        conn.commit()
-        
-        deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
-        required_str = ""
-        if required_fields_list:
-            required_str = f"\n📋 **Required Details:** {', '.join(required_fields_list)}"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
-        
-        # Use the appropriate method based on update type
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text(
-                f"✅ **ASSIGNMENT CREATED!**\n\n"
-                f"📌 **Title:** {context.user_data.get('assign_title', 'Untitled')}\n"
-                f"🔑 **Assignment Code:** `{code}`\n"
-                f"📊 **Max Score:** {max_score}/{scale}\n"
-                f"❓ **Question Type:** {context.user_data.get('assign_type', 'Short Answer')}"
-                f"{deadline_str}{required_str}\n\n"
-                f"Share the code with students so they can access this assignment!",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-        else:
-            # For callback queries
-            await update.callback_query.edit_message_text(
-                f"✅ **ASSIGNMENT CREATED!**\n\n"
-                f"📌 **Title:** {context.user_data.get('assign_title', 'Untitled')}\n"
-                f"🔑 **Assignment Code:** `{code}`\n"
-                f"📊 **Max Score:** {max_score}/{scale}\n"
-                f"❓ **Question Type:** {context.user_data.get('assign_type', 'Short Answer')}"
-                f"{deadline_str}{required_str}\n\n"
-                f"Share the code with students so they can access this assignment!",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-        
-    except Exception as e:
-        print(f"❌ Database error: {e}")
-        error_msg = "❌ Failed to create assignment. Please try again."
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text(error_msg)
-        else:
-            await update.callback_query.edit_message_text(error_msg)
-    finally:
-        cur.close()
-        conn.close()
+    cur.execute('''INSERT INTO assignments 
+                (assignment_id, teacher_id, code, title, question, 
+                 question_type, max_score, grading_scale, created_at, answers, 
+                 required_fields, deadline_at, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''',
+              (assignment_id, teacher_id, code, context.user_data['assign_title'],
+               context.user_data['assign_question'], context.user_data['assign_type'],
+               max_score, scale, datetime.now(), context.user_data['assign_answer'],
+               required_fields, deadline_at, 1))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    deadline_str = f"\n📅 **Deadline:** {get_deadline_string(deadline_at)}" if deadline_at else ""
+    required_str = ""
+    if context.user_data.get('required_fields'):
+        required_str = f"\n📋 **Required Details:** {', '.join(context.user_data['required_fields'])}"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="teacher_menu")]]
+    
+    await update.message.reply_text(
+        f"✅ **ASSIGNMENT CREATED!**\n\n"
+        f"📌 **Title:** {context.user_data['assign_title']}\n"
+        f"🔑 **Assignment Code:** `{code}`\n"
+        f"📊 **Max Score:** {max_score}/{scale}\n"
+        f"❓ **Question Type:** {context.user_data['assign_type']}"
+        f"{deadline_str}{required_str}\n\n"
+        f"Share the code with students so they can access this assignment!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
     
     # Clear assignment data
     context.user_data['assign_step'] = None
     context.user_data['required_fields'] = []
-    context.user_data['assign_title'] = None
-    context.user_data['assign_question'] = None
-    context.user_data['assign_type'] = None
-    context.user_data['assign_answer'] = None
-    context.user_data['assign_max_score'] = None
-    context.user_data['assign_deadline'] = None
 
 async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View assignment details and submissions"""
@@ -843,7 +801,7 @@ async def handle_view_assign_details(update: Update, context: ContextTypes.DEFAU
     return TEACHER_MENU
 
 async def handle_assignment_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle assignment creation text input - FIXED WITH ALL STEPS"""
+    """Handle assignment creation text input"""
     text = update.message.text.strip()
     assign_step = context.user_data.get('assign_step')
     teacher_id = context.user_data.get('teacher_id')
@@ -935,8 +893,7 @@ async def handle_assignment_type(update: Update, context: ContextTypes.DEFAULT_T
     
     await query.edit_message_text(
         f"✅ Question type: **{assign_type}**\n\n"
-        f"Step 4: Now send the correct answer(s):\n\n"
-        f"_For '{assign_type}' type, provide the expected answer that students should match._",
+        f"Step 4: Now send the correct answer(s):",
         parse_mode="Markdown"
     )
     
@@ -1054,19 +1011,12 @@ async def handle_proceed_deadline(update: Update, context: ContextTypes.DEFAULT_
     return CREATE_QUESTION
 
 async def handle_no_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Skip deadline setup - FIXED"""
+    """Skip deadline setup"""
     query = update.callback_query
     await query.answer()
     
     context.user_data['assign_deadline'] = None
     teacher_id = context.user_data.get('teacher_id')
-    
-    # Show confirmation before finalizing
-    await query.edit_message_text(
-        "⏭️ **No deadline set** - Assignment will remain open indefinitely.\n\n"
-        "Creating assignment..."
-    )
-    
     await finalize_assignment(update, context, teacher_id)
     return TEACHER_MENU
 
@@ -1131,7 +1081,8 @@ async def handle_deactivate_assign(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     
     assignment_id = context.user_data.get('edit_assign_id')
-    is_active = False if "deactivate" in query.data else True
+    action = query.data.replace("activate_assign", "").replace("deactivate_assign", "")
+    is_active = 0 if "deactivate" in query.data else True
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1302,7 +1253,7 @@ async def handle_edit_deadline(update: Update, context: ContextTypes.DEFAULT_TYP
     return CREATE_QUESTION
 
 async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input for edit fields (title, question, answer) - FIXED WITH DEADLINE"""
+    """Handle text input for edit fields (title, question, answer)"""
     text = update.message.text.strip()
     edit_mode = context.user_data.get('edit_mode')
     assignment_id = context.user_data.get('edit_assign_id')
@@ -2122,10 +2073,9 @@ def main():
     # Initialize PostgreSQL database
     init_db()
     
-    # Create application with connection pool settings to prevent conflicts
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).pool_timeout(30).connect_timeout(30).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # Main conversation handler - COMPLETELY FIXED
+    # Main conversation handler - EXPANDED
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -2210,18 +2160,9 @@ def main():
     print("✅ NEW: PostgreSQL database for better performance and reliability!")
     print("✅ FIXED: Teacher login now working properly!")
     print("✅ NEW: Assignment Deadlines | Student Details | Color-Coded Scores")
-    print("✅ FIXED: JSON parsing errors resolved!")
-    print("✅ FIXED: Deadline creation flow working!")
-    print("✅ FIXED: No deadline option working!")
     print("\n📍 Waiting for users...\n")
     
-    # Use better polling settings to prevent conflicts
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        poll_interval=1.0,
-        timeout=30,
-        drop_pending_updates=True
-    )
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
